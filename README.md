@@ -1,18 +1,18 @@
-# claude-skills
+# dot-claude
 
-Personal [Claude Code](https://code.claude.com) plugin marketplace.
+My [Claude Code](https://code.claude.com) setup, packaged as a plugin marketplace.
 
 ## Install
 
 ```
-/plugin marketplace add Leewonchan14/claude-skills
+/plugin marketplace add Leewonchan14/dot-claude
 /plugin install my-skills@wonchan
 ```
 
 Shell equivalent:
 
 ```
-claude plugin marketplace add Leewonchan14/claude-skills
+claude plugin marketplace add Leewonchan14/dot-claude
 claude plugin install my-skills@wonchan --scope user
 ```
 
