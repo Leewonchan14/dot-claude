@@ -1,0 +1,16 @@
+{
+  "name": "wonchan",
+  "owner": {
+    "name": "WonChan Lee"
+  },
+  "metadata": {
+    "description": "Personal Claude Code skills and plugins by Leewonchan14"
+  },
+  "plugins": [
+    {
+      "name": "my-skills",
+      "source": "./plugins/my-skills",
+      "description": "Personal skill collection"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "my-skills",
+  "description": "Personal skill collection",
+  "author": {
+    "name": "WonChan Lee"
+  },
+  "repository": "https://github.com/Leewonchan14/claude-skills",
+  "license": "MIT"
+}
