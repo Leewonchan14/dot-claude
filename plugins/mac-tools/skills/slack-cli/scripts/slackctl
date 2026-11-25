@@ -302,13 +302,80 @@ def parse_tip(text):
 
 def who_reacted(channel, ts_list, parent=None):
     """{ts: [{emoji, users}]} for messages of one channel (or one thread), read from the web client."""
+    data = run_ego(EGO_JS, {"channel": channel, "parent": parent, "items": ts_list}, timeout=60 + 25 * len(ts_list))
+    out = {}
+    for res in data["results"]:
+        out[res["ts"]] = {"error": res["error"]} if res.get("error") else [parse_tip(t) or {"raw": t} for t in res["tips"]]
+    return out
+
+
+# ---------------- thread in the web client (ego-browser) ----------------
+# Last resort for 'thread' when the desktop app cannot reach the parent (not rendered, no Activity item).
+# Opens app.slack.com/client/<team>/<C>/thread/<C>-<ts> in a short-lived ego-browser space and reads the
+# thread pane, scrolling it to collect every message of the virtual list. Read-only.
+
+WEB_THREAD_JS = r"""
+const P = __PARAMS__;
+const task = await taskSpace("slackctl thread " + Date.now());
+const out = { team: P.team, messages: [] };
+try {
+  const page = task.page("p1");
+  if (!out.team) {
+    await page.goto("https://app.slack.com/client/", { timeout: 30000 });
+    await page.waitForURL(/\/client\/T[A-Z0-9]+/, { timeout: 30000 });
+    out.team = (await page.url()).match(/\/client\/(T[A-Z0-9]+)/)[1];
+  }
+  const prefix = P.channel + "-" + P.ts + "-thread-list-Thread_";
+  await page.goto("https://app.slack.com/client/" + out.team + "/" + P.channel + "/thread/" + P.channel + "-" + P.ts, { timeout: 30000 });
+  await page.waitForSelector('[id^="' + prefix + '"]', { timeout: 20000 });
+  await page.waitForTimeout(1500);
+  const seen = {};
+  for (let step = 0; step < 40; step++) {
+    const r = await page.evaluate(({ prefix, step }) => {
+      const rows = [...document.querySelectorAll('[id^="' + prefix + '"]')]
+        .filter((el) => /_\d+\.\d+$/.test(el.id))
+        .map((el) => ({
+          ts: el.id.slice(el.id.lastIndexOf("_") + 1),
+          sender: el.querySelector('[data-qa="message_sender_name"]')?.innerText || null,
+          text: el.querySelector('[data-qa="message-text"]')?.innerText || "",
+          reactions: [...el.querySelectorAll(".c-reaction")].map((x) => ({
+            emoji: (x.querySelector("img[data-stringify-emoji]")?.getAttribute("data-stringify-emoji")
+              || x.querySelector("img")?.getAttribute("alt") || "").replace(/^:|:$/g, ""),
+            count: parseInt(x.querySelector(".c-reaction__count")?.innerText || "0", 10),
+            me: x.classList.contains("c-reaction--reacted"),
+          })),
+        }));
+      const first = document.querySelector('[id^="' + prefix + '"]');
+      const sc = first && first.closest(".c-scrollbar__hider");
+      let done = true;
+      if (sc) {
+        if (step === 0) sc.scrollTop = 0;
+        else { done = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2; sc.scrollTop += sc.clientHeight * 0.8; }
+      }
+      return { rows, done };
+    }, { prefix, step });
+    for (const m of r.rows) seen[m.ts] = seen[m.ts] || m;
+    if (step > 0 && r.done) break;
+    await page.waitForTimeout(500);
+  }
+  out.messages = Object.values(seen).sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+} catch (e) {
+  out.error = String(e && e.message || e).slice(0, 300);
+} finally {
+  await task.finish({ keep: [] });
+}
+console.log("SLACKCTL_JSON " + JSON.stringify(out));
+"""
+
+
+def run_ego(js, params, timeout):
+    """Run an ego-browser script that prints 'SLACKCTL_JSON {...}'; caches the team id it reports."""
     team = open(TEAM_FILE).read().strip() if os.path.exists(TEAM_FILE) else None
-    params = {"team": team, "channel": channel, "parent": parent, "items": ts_list}
-    script = EGO_JS.replace("__PARAMS__", json.dumps(params))
+    script = js.replace("__PARAMS__", json.dumps({"team": team, **params}))
     try:
-        r = subprocess.run(["ego-browser", "nodejs"], input=script, capture_output=True, text=True, timeout=60 + 25 * len(ts_list))
+        r = subprocess.run(["ego-browser", "nodejs"], input=script, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
-        raise SlackError("ego-browser is not installed; it is needed to see who reacted")
+        raise SlackError("ego-browser is not installed")
     m = re.search(r"SLACKCTL_JSON (\{.*\})", r.stdout + "\n" + r.stderr)  # ego-browser prints console.log to stderr
     if not m:
         raise SlackError("ego-browser gave no result: " + (r.stdout + r.stderr).strip()[-600:])
@@ -319,10 +386,17 @@ def who_reacted(channel, ts_list, parent=None):
         os.makedirs(CACHE, exist_ok=True)
         with open(TEAM_FILE, "w") as fh:
             fh.write(data["team"])
-    out = {}
-    for res in data["results"]:
-        out[res["ts"]] = {"error": res["error"]} if res.get("error") else [parse_tip(t) or {"raw": t} for t in res["tips"]]
-    return out
+    return data
+
+
+def web_thread(channel, ts):
+    data = run_ego(WEB_THREAD_JS, {"channel": channel, "ts": ts}, timeout=120)
+    msgs, last = [], None
+    for m in data["messages"]:
+        last = m["sender"] or last  # Slack hides the name on consecutive messages of one sender
+        msgs.append({"ts": m["ts"], "time": kst(m["ts"]), "sender": last, "text": " ".join(m["text"].split()),
+                     "meta": "", "replies": 0, "reactions": m["reactions"]})
+    return msgs
 
 
 def attach_who(msgs, channel, parent=None):
@@ -365,12 +439,61 @@ def flexpane_start(nodes):
     return next((n["i"] for n in nodes if re.search(r"p-flexpane|threads_flexpane", cls(n))), None)
 
 
+def thread_shown(ts):
+    """Predicate: the thread pane shows the thread of parent ts. Pane nodes are '<C>-<ts>-thread-list-Thread_<msg>',
+    but Slack keeps the <C>-<ts> prefix of the first thread it opened, so only the parent's own row is reliable."""
+    suffix = f"-thread-list-Thread_{ts}"
+    return lambda ns: any((n.get("id") or "").endswith(suffix) for n in ns)
+
+
+def activity_thread_item(channel, ts, pages=6):
+    """The Activity item of the thread channel/ts, scrolling the list a few pages. Prefers 'thread_v2' items
+    (they open the thread) over mentions of a reply ('at_user-<C>-<reply>-<parent>')."""
+    activity_open("all")
+    tail = re.compile(rf"^(thread_v2|at_user|at_channel|at_everyone)-{re.escape(channel)}-(?:\d+\.\d+-)?{re.escape(ts)}$")
+    seen = set()
+    for _ in range(pages):
+        nodes = dump()
+        items = activity_items(nodes)
+        hits = [it for it in items if tail.match(it["id"])]
+        hit = next((it for it in hits if it["kind"] == "thread_v2"), None) or (hits[0] if hits else None)
+        if hit:
+            return nodes, hit
+        before = len(seen)
+        seen.update(it["id"] for it in items)
+        if not items or len(seen) == before:
+            return nodes, None
+        ax("show", f"i:{items[-1]['i']}")
+        time.sleep(0.9)
+    return dump(), None
+
+
+def open_thread_via_activity(channel, ts):
+    """Open a thread whose parent is no longer rendered in the channel by pressing its Activity notification.
+    This marks that notification read. Returns the nodes with the thread pane, or None."""
+    nodes, it = activity_thread_item(channel, ts)
+    if not it:
+        return None
+    k = next(j for j, n in enumerate(nodes) if n["i"] == it["i"])
+    btn = next((s for s in subtree(nodes, k) if s.get("acts") and "AXPress" in s["acts"]), None)
+    act("press", f"i:{(btn or it)['i']}")
+    return wait_for(thread_shown(ts), timeout=6)
+
+
 def open_thread(conv, ts):
-    open_conv(conv)
+    row = open_conv(conv)
     nodes = dump()
     k = next((n["i"] for n in nodes if n.get("id") == f"message-list_{ts}"), None)
     if k is None:
-        raise SlackError(f"message {ts} is not rendered in {conv}; only recent messages can be reached")
+        # The channel view renders only a window of messages; a busy channel drops yesterday's parent.
+        got = open_thread_via_activity(row["id"], ts)
+        if got:
+            return got
+        nodes = dump()  # a mention of the parent itself jumps to it in the channel instead of opening the thread
+        k = next((n["i"] for n in nodes if n.get("id") == f"message-list_{ts}"), None)
+    if k is None:
+        raise SlackError(f"message {ts} is not rendered in {conv} and has no Activity notification; "
+                         "only recent messages and threads you are in can be reached")
     sub = subtree(nodes, k)
     btn = next((s for s in sub if s.get("acts") and re.search(r"\d+ repl", s.get("text") or "")), None) \
         or next((s for s in sub if s.get("acts") and s.get("text") == "Reply to thread"), None)
@@ -378,7 +501,7 @@ def open_thread(conv, ts):
         act("press", f"i:{btn['i']}")
     else:  # no replies yet: the hover-only "Reply to thread" button is not rendered, use the context menu
         menu_pick(k, r"^Reply in thread")
-    nodes = wait_for(lambda ns: flexpane_start(ns) is not None and any("thread-list-Thread_" in (n.get("id") or "") for n in ns), timeout=5)
+    nodes = wait_for(thread_shown(ts), timeout=5)
     if not nodes:
         raise SlackError("thread pane did not open")
     return nodes
@@ -526,7 +649,16 @@ def cmd_read(a):
 
 
 def cmd_thread(a):
-    nodes = open_thread(a.conversation, a.ts)
+    try:
+        nodes = open_thread(a.conversation, a.ts)
+    except SlackError as e:
+        if a.no_web or "is not rendered" not in str(e):
+            raise
+        # Neither the channel view nor Activity reaches it: read it in the web client instead.
+        msgs = web_thread(conv_id(a.conversation), a.ts)
+        if a.who:
+            attach_who(msgs, conv_id(a.conversation), parent=a.ts)
+        return {"conversation": a.conversation, "thread": a.ts, "messages": msgs, "source": "web client (ego-browser)"}
     msgs = message_nodes(nodes, thread=True)
     for m in msgs:
         m.pop("i", None)
@@ -948,7 +1080,8 @@ def show(cmd, d):
         if d.get("moreUnreadsBelow"):
             print("  (more unread conversations further down the sidebar)")
     elif cmd in ("read", "thread"):
-        print(f"# {d['conversation']}" + (f" · thread {d['thread']}" if cmd == "thread" else ""))
+        print(f"# {d['conversation']}" + (f" · thread {d['thread']}" if cmd == "thread" else "")
+              + (f"  (via {d['source']})" if d.get("source") else ""))
         for m in d["messages"]:
             extra = f"  [{m['replies']} replies]" if m.get("replies") else ""
             print(f"{m['time']}  {m['sender'] or '?'}: {m['text']}{extra}   ts={m['ts']}")
@@ -995,6 +1128,7 @@ def main():
     p.add_argument("--who", action="store_true", help="also show who reacted (Slack web client in ego-browser)")
     p = add("thread", help="messages of a thread"); p.add_argument("conversation"); p.add_argument("ts")
     p.add_argument("--who", action="store_true", help="also show who reacted (Slack web client in ego-browser)")
+    p.add_argument("--no-web", action="store_true", help="do not fall back to the Slack web client in ego-browser")
     p = add("reactions", help="who reacted to one message, per emoji (Slack web client in ego-browser)")
     p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("--thread", help="parent ts when the message is a thread reply")
     p = add("activity", help="notifications; 'activity mark <id> read|unread'")

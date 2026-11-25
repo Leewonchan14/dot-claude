@@ -31,7 +31,7 @@ posted only to Slack's process, so **Slack stays in the background and the mouse
 | `slackctl unread` | read | Conversations with unread messages (+ Threads) |
 | `slackctl channels [--unread]` | read | Sidebar conversations: name, kind, id |
 | `slackctl read <conv> [-n 20]` | read | Recent messages with time, sender, text, ts, reply count, reactions |
-| `slackctl thread <conv> <ts>` | read | All messages of a thread, with reactions |
+| `slackctl thread <conv> <ts> [--no-web]` | read | All messages of a thread, with reactions (falls back to Activity, then the web client) |
 | `slackctl read\|thread … --who` | read | Same, plus who reacted (Slack web client in ego-browser) |
 | `slackctl reactions <conv> <ts> [--thread <parent-ts>]` | read | Who reacted to one message, per emoji (ego-browser) |
 | `slackctl activity [--unread] [--tab all\|dms\|mentions\|threads] [-n 30]` | read | Notifications (Activity), with item ids |
@@ -74,6 +74,15 @@ posted only to Slack's process, so **Slack stays in the background and the mouse
 - `schedule` takes a time today at least 2 minutes ahead; Slack rejects closer times. Other days are not supported yet.
 - `forward --to` can only pick from Slack's suggestion list (recent conversations), because typed search text
   does not reach Slack's search. If the target is missing, the command lists what was offered.
+- `thread` opens a thread from its parent in the channel view. A busy channel renders only a window of
+  recent messages, so yesterday's parent may be missing; then `thread` presses the thread's Activity
+  notification (`thread_v2-<C>-<ts>`, or a mention in it), which opens the pane in the background and
+  **marks that notification read**. If there is no such notification either, `thread` (read only) opens
+  the thread in the Slack web client in ego-browser and prints `(via web client)`; `--no-web` turns
+  that off. `send --thread`, `edit --thread`, `react --thread` and `forward --thread` use the first two
+  steps only.
+- Thread pane AX ids keep the `<C>-<ts>` prefix of the first thread Slack opened, so a thread is matched by
+  its parent's row id ending in `-thread-list-Thread_<ts>`, not by the prefix.
 - `edit` / `forward` / `send --thread` / `react` need the target message to be rendered (recent).
 - Who reacted is not in the desktop app's AX tree: Slack shows the names only in a hover tooltip, which AX
   cannot open (focus and mouse-moved events posted to Slack's pid do not trigger it). `--who` and `reactions`
