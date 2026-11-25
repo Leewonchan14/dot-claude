@@ -27,7 +27,7 @@ On a Mac, also install the macOS-only tools:
 | Plugin | Where | Skills |
 |---|---|---|
 | `my-skills` | any machine | `ppt-explain`, `example` |
-| `mac-tools` | macOS only | `mail-cli` (mailctl), `mail-archiving`, `slack-cli` (slackctl), `notion-cli` (notionctl) |
+| `mac-tools` | macOS only | `mail-cli` (mailctl), `mail-archiving`, `slack-cli` (slackctl), `notion-cli` (notionctl), `kakao-cli` (kakaoctl) |
 
 The `mac-tools` skills drive Mail.app, the Slack desktop app and the Notion desktop app, and need macOS
 permissions (Full Disk Access, Automation, Accessibility). Their commands live in each skill's `scripts/`

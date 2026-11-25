@@ -15,7 +15,7 @@
     {
       "name": "mac-tools",
       "source": "./plugins/mac-tools",
-      "description": "macOS-only CLIs for Mail.app, Slack and Notion. Install on Macs only."
+      "description": "macOS-only CLIs for Mail.app, Slack, Notion and KakaoTalk. Install on Macs only."
     }
   ]
 }

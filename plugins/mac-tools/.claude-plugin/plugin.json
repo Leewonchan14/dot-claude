@@ -1,6 +1,6 @@
 {
   "name": "mac-tools",
-  "description": "macOS-only CLIs for desktop apps: Mail.app (mailctl), Slack (slackctl), Notion (notionctl)",
+  "description": "macOS-only CLIs for desktop apps: Mail.app (mailctl), Slack (slackctl), Notion (notionctl), KakaoTalk (kakaoctl)",
   "author": {
     "name": "WonChan Lee"
   },

@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""kakaoctl - read and drive the KakaoTalk Mac app through macOS Accessibility.
+
+Reads the chat list and open chat windows, sends messages and closes chat windows without bringing
+KakaoTalk to the front. Opening a chat room is the one exception: KakaoTalk only opens a room while it
+is the active app, so 'open' (and 'read'/'send' on a room that is not open yet) activates KakaoTalk for
+about 0.7 s and then gives focus back to the previous app.
+
+Opening a room marks its messages read for the other people. 'read' refuses to open a room that has
+unread messages unless --mark-read is given. Write commands print a preview and do nothing unless
+--yes is given.
+
+Examples
+  kakaoctl status
+  kakaoctl chats -n 20
+  kakaoctl unread
+  kakaoctl read @me -n 10              # 나와의 채팅
+  kakaoctl read "가족, 친구" --mark-read
+  kakaoctl send @me "hello" --yes
+  kakaoctl close @me
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SRC = os.path.join(HERE, "kakao_ax.swift")
+CACHE = os.path.expanduser("~/Library/Caches/kakaoctl")
+TIME = re.compile(r"^(오전|오후) \d{1,2}:\d{2}$")
+LIST_WHEN = re.compile(r"^((오전|오후) \d{1,2}:\d{2}|어제|\d{1,2}월 \d{1,2}일|\d{4}\. ?\d{1,2}\. ?\d{1,2}\.?)$")
+
+
+class KakaoError(Exception):
+    pass
+
+
+# ---------------- helper binary ----------------
+
+def helper_path():
+    with open(SRC, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+    path = os.path.join(CACHE, f"kakao_ax-{digest}")
+    if not os.path.exists(path):
+        os.makedirs(CACHE, exist_ok=True)
+        r = subprocess.run(["swiftc", "-O", SRC, "-o", path], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise KakaoError("failed to compile kakao_ax.swift:\n" + r.stderr[-2000:])
+    return path
+
+
+HELPER = None
+
+
+def ax(*args, timeout=60):
+    global HELPER
+    HELPER = HELPER or helper_path()
+    r = subprocess.run([HELPER, *map(str, args)], capture_output=True, text=True, timeout=timeout)
+    outp = r.stdout.strip()
+    try:
+        data = json.loads(outp) if outp else {}
+    except ValueError:
+        raise KakaoError(outp or r.stderr.strip() or f"kakao_ax exited {r.returncode}")
+    if r.returncode != 0 or "error" in data:
+        raise KakaoError(data.get("error") or r.stderr.strip() or f"kakao_ax exited {r.returncode}")
+    return data
+
+
+# ---------------- chat list ----------------
+
+def parse_row(i, items):
+    """One chat-list row -> dict. Layout: 프로필 button, badge images, name, [members], time, [image],
+    last message (TextArea), [pin/mute images], [unread count]."""
+    images = [x["t"] for x in items if x["r"] == "Image" and x["t"]]
+    ti = next((k for k, x in enumerate(items) if x["r"] == "TextArea"), len(items))
+    before = [x["t"] for x in items[:ti] if x["r"] == "StaticText"]
+    after = [x["t"] for x in items[ti:] if x["r"] == "StaticText"]
+    name = before[0] if before else ""
+    members = when = None
+    for t in before[1:]:
+        if LIST_WHEN.match(t):
+            when = t
+        elif t.isdigit():
+            members = int(t)
+    unread = next((int(t) for t in after if t.replace(",", "").rstrip("+").isdigit()), 0) if after else 0
+    last = next((x["t"] for x in items if x["r"] == "TextArea"), "")
+    return {
+        "index": i, "name": name, "members": members, "when": when, "last": last, "unread": unread,
+        "me": "badge me" in images, "pinned": any("pin" in m for m in images),
+        "muted": any("notioff" in m for m in images),
+    }
+
+
+def list_chats(n=30):
+    d = ax("chats", n)
+    return d["total"], [parse_row(i, r) for i, r in enumerate(d["rows"])]
+
+
+def find_chat(query, n=None):
+    """Find a chat by exact name, '@me', or unique prefix. Looks at the newest 30 rows first, then all."""
+    if n is None:
+        try:
+            return find_chat(query, 30)
+        except KakaoError as e:
+            if "ambiguous" in str(e) or "are named" in str(e):
+                raise
+        n = 0
+    _, rows = list_chats(n)
+    q = query.strip()
+    if q.lower() in ("@me", "me", "나", "나와의 채팅"):
+        hit = next((r for r in rows if r["me"]), None)
+        if hit:
+            return hit
+        raise KakaoError("나와의 채팅 not found in the chat list")
+    exact = [r for r in rows if r["name"] == q]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise KakaoError(f"{len(exact)} chats are named '{q}'; rename one in KakaoTalk")
+    pref = [r for r in rows if r["name"].lower().startswith(q.lower())]
+    if len(pref) == 1:
+        return pref[0]
+    if len(pref) > 1:
+        raise KakaoError("ambiguous chat name, candidates: " + ", ".join(r["name"] for r in pref[:10]))
+    raise KakaoError(f"chat not found: {query}")
+
+
+def open_windows():
+    return ax("windows")
+
+
+def resolve_open(query):
+    """Name of an already-open chat window matching query, without reading the chat list."""
+    wins = open_windows()["chats"]
+    if query in wins:
+        return query
+    return None
+
+
+def ensure_open(query, allow_unread):
+    title = resolve_open(query) if query.lower() not in ("@me", "me", "나", "나와의 채팅") else None
+    if title:
+        return title, False
+    row = find_chat(query)
+    if row["name"] in open_windows()["chats"]:
+        return row["name"], False
+    if row["unread"] and not allow_unread:
+        raise KakaoError(f"'{row['name']}' has {row['unread']} unread message(s); opening it marks them read. "
+                         f"Last message: {row['last'][:80]!r}. Re-run with --mark-read to open it anyway.")
+    res = ax("open", row["name"], row["index"])
+    return row["name"], res.get("flashed", False)
+
+
+# ---------------- messages ----------------
+
+def parse_messages(rows):
+    """Message rows -> [{time, sender, mine, text, unread}]. Times and names are shown only on the first
+    message of a run, so they carry over. Date separators carry no text in AX and are skipped."""
+    msgs = []
+    last_time = None
+    last_sender = {"left": None}
+    for items in rows:
+        meaningful = [x for x in items if not (x["r"] == "Button" and x["t"] in ("", "공유", "프로필"))]
+        if not meaningful:
+            continue  # date separator / spacer row
+        body_items = [x for x in items if x["r"] in ("TextArea", "Image") and not (x["r"] == "Image" and x["t"])]
+        xs = [x["x"] for x in body_items] or [x["x"] for x in meaningful]
+        mine = (sum(xs) / len(xs)) > 0.5
+        has_profile = any(x["r"] == "Button" and x["t"] == "프로필" for x in items)
+        time_ = sender = None
+        unread = None
+        for x in items:
+            if x["r"] != "StaticText":
+                continue
+            parts = [p.strip() for p in x["t"].split("\n") if p.strip()]
+            for p in parts:
+                if TIME.match(p):
+                    time_ = p
+                elif p.isdigit() and len(p) <= 3:
+                    unread = int(p)
+                elif not mine and sender is None:
+                    sender = p
+        if time_:
+            last_time = time_
+        if not mine:
+            if sender:
+                last_sender["left"] = sender
+            elif has_profile:
+                last_sender["left"] = None
+            sender = sender or last_sender["left"]
+        texts = [x["t"] for x in items if x["r"] == "TextArea" and x["t"]]
+        text = "\n".join(texts) if texts else ("[사진/이모티콘]" if any(x["r"] == "Image" for x in items) else "")
+        if not text and not time_ and not sender:
+            continue
+        msgs.append({"time": time_ or last_time, "sender": "me" if mine else sender, "mine": mine,
+                     "text": text, "unread": unread})
+    return msgs
+
+
+# ---------------- commands ----------------
+
+def cmd_status(a):
+    w = open_windows()
+    return {"mainWindow": w["main"], "openChats": w["chats"], "kakaoFront": w["front"], "hidden": w["hidden"]}
+
+
+def cmd_show(a):
+    return ax("show")
+
+
+def cmd_hide(a):
+    return ax("hide")
+
+
+def cmd_chats(a):
+    total, rows = list_chats(a.limit)
+    return {"total": total, "chats": rows}
+
+
+def cmd_unread(a):
+    total, rows = list_chats(a.limit)
+    return {"scanned": len(rows), "total": total, "chats": [r for r in rows if r["unread"]]}
+
+
+def cmd_read(a):
+    title, flashed = ensure_open(a.chat, a.mark_read)
+    d = ax("messages", title, a.limit * 2 + 10)
+    msgs = parse_messages(d["rows"])[-a.limit:]
+    return {"chat": title, "loaded": d["loaded"], "flashed": flashed, "messages": msgs}
+
+
+def cmd_open(a):
+    title, flashed = ensure_open(a.chat, a.mark_read)
+    return {"chat": title, "flashed": flashed}
+
+
+def cmd_send(a):
+    title = resolve_open(a.chat)
+    row = None
+    if not title:
+        row = find_chat(a.chat)
+        title = row["name"]
+    if not a.yes:
+        return {"dryRun": True, "chat": title, "text": a.text,
+                "note": None if (row is None or row["name"] in open_windows()["chats"]) else
+                "the room is not open: KakaoTalk will be activated briefly to open it"
+                + (f" and its {row['unread']} unread message(s) will be marked read" if row["unread"] else "")}
+    title, flashed = ensure_open(title, True)
+    res = ax("send", title, a.text)
+    if not res.get("ok"):
+        raise KakaoError(f"send may have failed: {res}")
+    d = ax("messages", title, 4)
+    return {"sent": True, "chat": title, "flashed": flashed, "last": parse_messages(d["rows"])[-1:]}
+
+
+def cmd_close(a):
+    wins = open_windows()["chats"]
+    targets = wins if a.chat == "all" else [resolve_open(a.chat) or find_chat(a.chat)["name"]]
+    closed = []
+    for t in targets:
+        if t in wins:
+            ax("close", t)
+            closed.append(t)
+    return {"closed": closed}
+
+
+# ---------------- output ----------------
+
+def show(cmd, d):
+    if isinstance(d, dict) and d.get("dryRun"):
+        print("dry run (add --yes to do it):")
+        print(json.dumps({k: v for k, v in d.items() if k != "dryRun" and v is not None}, ensure_ascii=False, indent=2))
+        return
+    if cmd == "status":
+        state = "hidden" if d["hidden"] else ("front" if d["kakaoFront"] else "background")
+        print(f"main window: {'open' if d['mainWindow'] else 'closed'} · KakaoTalk {state}")
+        print("open chats: " + (", ".join(d["openChats"]) or "none"))
+    elif cmd in ("chats", "unread"):
+        rows = d["chats"]
+        if cmd == "unread":
+            print(f"{len(rows)} chats with unread messages (scanned {d['scanned']} of {d['total']})")
+        else:
+            print(f"{len(rows)} of {d['total']} chats")
+        for r in rows:
+            flag = f"●{r['unread']:<3}" if r["unread"] else "    "
+            tags = "".join([" 📌" if r["pinned"] else "", " 🔕" if r["muted"] else "", " (나)" if r["me"] else ""])
+            name = r["name"] + (f" ({r['members']})" if r["members"] else "") + tags
+            last = r["last"].replace("\n", " ")
+            print(f"{flag} {name:<28} {r['when'] or '':<9} {last[:60]}")
+    elif cmd == "read":
+        print(f"# {d['chat']}" + ("  (KakaoTalk was activated briefly to open it)" if d["flashed"] else ""))
+        for m in d["messages"]:
+            who = "나" if m["mine"] else (m["sender"] or "?")
+            un = f"  ({m['unread']})" if m.get("unread") else ""
+            print(f"{m['time'] or '':<9} {who}: {m['text']}{un}")
+    elif cmd == "send":
+        print(f"sent to {d['chat']}" + ("  (KakaoTalk was activated briefly to open it)" if d["flashed"] else ""))
+    elif cmd == "open":
+        print(f"opened {d['chat']}" + ("  (KakaoTalk was activated briefly)" if d["flashed"] else ""))
+    elif cmd == "close":
+        print("closed: " + (", ".join(d["closed"]) or "nothing"))
+    elif cmd in ("show", "hide"):
+        print(("ok" if d.get("ok") else f"{cmd} failed") + ("  (KakaoTalk was activated briefly)" if d.get("flashed") else ""))
+    else:
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="kakaoctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    add = lambda *x, **k: sub.add_parser(*x, parents=[common], **k)
+
+    add("status", help="main window and open chat windows")
+    p = add("chats", help="chat list, newest first"); p.add_argument("-n", "--limit", type=int, default=30, help="rows to read (0 = all, ~30 ms per row)")
+    p = add("unread", help="chats with unread messages"); p.add_argument("-n", "--limit", type=int, default=60, help="rows to scan (0 = all)")
+    p = add("read", help="recent messages of a chat (opens it if needed)")
+    p.add_argument("chat"); p.add_argument("-n", "--limit", type=int, default=20); p.add_argument("--mark-read", action="store_true")
+    p = add("open", help="open a chat window"); p.add_argument("chat"); p.add_argument("--mark-read", action="store_true")
+    p = add("send", help="send a message"); p.add_argument("chat"); p.add_argument("text"); p.add_argument("--yes", action="store_true")
+    add("show", help="unhide KakaoTalk and reopen its main window if it is closed (brief activation)")
+    add("hide", help="hide KakaoTalk")
+    p = add("close", help="close a chat window ('all' closes every chat window)"); p.add_argument("chat")
+
+    a = ap.parse_args()
+    try:
+        data = globals()["cmd_" + a.cmd](a)
+    except KakaoError as e:
+        sys.exit(f"kakaoctl: {e}")
+    except subprocess.TimeoutExpired:
+        sys.exit("kakaoctl: KakaoTalk did not answer in time")
+    if a.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        show(a.cmd, data)
+
+
+if __name__ == "__main__":
+    main()
