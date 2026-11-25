@@ -85,10 +85,13 @@ def parse_row(i, items):
             when = t
         elif t.isdigit():
             members = int(t)
-    unread = next((int(t) for t in after if t.replace(",", "").rstrip("+").isdigit()), 0) if after else 0
+    # KakaoTalk caps the badge at "300+"; keep the number and remember the cap for display.
+    badge = next((t for t in after if t.replace(",", "").rstrip("+").isdigit()), None)
+    unread = int(badge.replace(",", "").rstrip("+")) if badge else 0
+    unread_more = bool(badge and badge.endswith("+"))
     last = next((x["t"] for x in items if x["r"] == "TextArea"), "")
     return {
-        "index": i, "name": name, "members": members, "when": when, "last": last, "unread": unread,
+        "index": i, "name": name, "members": members, "when": when, "last": last, "unread": unread, "unread_more": unread_more,
         "me": "badge me" in images, "pinned": any("pin" in m for m in images),
         "muted": any("notioff" in m for m in images),
     }
@@ -285,7 +288,8 @@ def show(cmd, d):
         else:
             print(f"{len(rows)} of {d['total']} chats")
         for r in rows:
-            flag = f"●{r['unread']:<3}" if r["unread"] else "    "
+            count = f"{r['unread']}+" if r.get("unread_more") else str(r["unread"])
+            flag = f"●{count:<4}" if r["unread"] else "     "
             tags = "".join([" 📌" if r["pinned"] else "", " 🔕" if r["muted"] else "", " (나)" if r["me"] else ""])
             name = r["name"] + (f" ({r['members']})" if r["members"] else "") + tags
             last = r["last"].replace("\n", " ")
