@@ -31,8 +31,14 @@ On a Mac, also install the macOS-only tools:
 
 The `mac-tools` skills drive Mail.app, the Slack desktop app and the Notion desktop app, and need macOS
 permissions (Full Disk Access, Automation, Accessibility). Their commands live in each skill's `scripts/`
-folder; link them onto your PATH if you want to call them directly, for example
-`ln -s <plugin path>/skills/mail-cli/scripts/mailctl ~/.local/bin/mailctl`.
+folder. The skills call them by name, so link them onto your PATH from the marketplace clone, which keeps
+the same path across updates:
+
+```
+for c in mail-cli/scripts/mailctl slack-cli/scripts/slackctl notion-cli/scripts/notionctl kakao-cli/scripts/kakaoctl; do
+  ln -sf ~/.claude/plugins/marketplaces/wonchan/plugins/mac-tools/skills/$c ~/.local/bin/
+done
+```
 
 ## Update
 

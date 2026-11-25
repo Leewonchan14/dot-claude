@@ -7,19 +7,24 @@ Notion must run with a local debugging port: "notionctl launch --yes" restarts i
 (127.0.0.1:9333). "notionctl launch --normal --yes" restarts it without the port.
 
 Pages are addressed by an open tab: a Notion URL, a page id (32 hex, dashes optional) or a
-title substring. Only tabs that are already open (and loaded) can be used.
+title substring. Commands other than "open" and "workspace" only work on tabs that are open and loaded.
+
+"notionctl workspace" lists the accounts and workspaces of the switcher menu; "notionctl workspace
+<name> [--account <email>]" switches the tab shown in Notion to it (other tabs keep their page).
 
 "notionctl open" puts a page into a tab first: by URL/id (into the blank tab, or --in <tab>), or by
 following a sub-page link inside an open page. Notion only renders the blocks near the scroll position;
 "blocks" and "read" scroll through the whole page (--visible reads only what is rendered).
 
-Write commands (move, edit, append, image add, file add, db sort, launch) print a preview and do
-nothing unless --yes is given.
+Write commands (move, edit, append, image add, file add, delete, db sort, launch) print a preview
+and do nothing unless --yes is given.
 
 Examples
   notionctl status
   notionctl open https://app.notion.com/p/<page-id>
   notionctl open "Parent page" "Child page"    # follow a sub-page link in an open page
+  notionctl workspace
+  notionctl workspace "Team space" --account work@example.com
   notionctl blocks ctl
   notionctl read ctl
   notionctl move ctl "Block C" up --yes
@@ -29,6 +34,7 @@ Examples
   notionctl image read ctl 1 -o /tmp/img.png
   notionctl image add ctl ./pic.png --after "Block C" --yes
   notionctl file add ctl ./doc.pdf --after "Block C" --yes
+  notionctl delete ctl doc.pdf --yes
   notionctl db list ctl
   notionctl db rows ctl
   notionctl db view ctl "By Status"
@@ -410,6 +416,7 @@ function parseArgs(argv) {
     else if (x === '--db') a.db = Number(argv[++i]);
     else if (x === '--after') a.after = argv[++i];
     else if (x === '--in') a.in = argv[++i];
+    else if (x === '--account') a.account = argv[++i];
     else if (x === '--visible') a.visible = true;
     else if (x === '-h' || x === '--help') a.help = true;
     else a._.push(x);
@@ -555,20 +562,84 @@ async function newBlockAfter(p, after) {
   return now;
 }
 
+// Returns the id of a new empty text block right after `after`, with the caret in it.
+// Text block: Enter at its end. Other blocks (file, image, page, ...): Enter at the start of the next
+// text block, which Notion answers with a new empty block above it. Last block: click below it.
+async function emptyBlockAfter(p, blocks, after) {
+  await reveal(p, after.id);
+  if (TEXTISH.includes(after.type)) return newBlockAfter(p, after);
+  const i = blocks.findIndex((b) => b.id === after.id);
+  const next = blocks.slice(i + 1).find((b) => b.depth <= after.depth);
+  if (!next || next.depth !== after.depth) {
+    if (after.depth) throw new CtlError('cannot add after the last nested block (' + after.type + ')');
+    return emptyBlockAtEnd(p, after);
+  }
+  if (next.type !== 'text') throw new CtlError('cannot add a block after this ' + after.type + ' block: the next block is a ' + next.type + ', not a text block');
+  await reveal(p, next.id);
+  const np = await p.eval(JS_BLOCK_POINT, next.id, 'head');
+  if (!np || !np.editable) throw new CtlError('the next block has no editable text');
+  const seen = new Set((await getBlocks(p, true)).blocks.map((b) => b.id));
+  await p.click(np);
+  const c = await p.eval(JS_CARET_INFO);
+  if (!c || c.id !== next.id || !c.atStart) throw new CtlError('could not put the caret at the start of the next block; nothing changed');
+  await p.key('Enter');
+  const nb = await waitFor(async () => {
+    const v = (await getBlocks(p, true)).blocks;
+    const k = v.findIndex((b) => b.id === next.id);
+    const prev = k > 0 ? v[k - 1] : null;
+    return prev && !seen.has(prev.id) ? prev : null;
+  }, 4000, 250);
+  if (!nb) throw new CtlError('Enter did not create a new block above "' + next.text.slice(0, 30) + '"; check the page');
+  await caretInto(p, nb, 'end');
+  const c2 = await p.eval(JS_CARET_INFO);
+  if (!c2 || c2.id !== nb.id || !c2.empty) throw new CtlError('a new block was made but the caret is not in it; check the page');
+  return nb.id;
+}
+
+const TEXTISH = ['text', 'header', 'sub_header', 'sub_sub_header', 'quote', 'bulleted_list', 'numbered_list', 'to_do'];
+
+// Clicking below the last block or the hover "+" button does not add a block when driven over CDP
+// (tested 2026-11-25), so a page that ends in a non-text block needs a text line at the end first.
+async function emptyBlockAtEnd(p, last) {
+  throw new CtlError('the page ends with a ' + last.type + ' block; notionctl can only add after it when a text block follows. Add an empty line at the end of the page in Notion, or use --after <text block>');
+}
+
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+  pdf: 'application/pdf', zip: 'application/zip', txt: 'text/plain', csv: 'text/csv', json: 'application/json', md: 'text/markdown',
+  doc: 'application/msword', xls: 'application/vnd.ms-excel', ppt: 'application/vnd.ms-powerpoint', hwp: 'application/x-hwp',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  mp4: 'video/mp4', mov: 'video/quicktime', mp3: 'audio/mpeg' };
+
+// Paste a local file into the focused (empty) block, as Notion does for a file on the clipboard.
+async function pasteFile(p, file, mime) {
+  const b64 = fs.readFileSync(file).toString('base64');
+  const ok = await p.eval(String(function (b64, name, mime) {
+    const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    const dt = new DataTransfer(); dt.items.add(new File([u], name, { type: mime }));
+    const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    document.activeElement.dispatchEvent(ev); return ev.defaultPrevented;
+  }), b64, path.basename(file), mime);
+  if (!ok) throw new CtlError('Notion ignored the paste');
+}
+
 async function cmdAppend(a) {
   const [, page, text] = a._;
   if (text == null) throw new CtlError('usage: notionctl append <page> "<text>" [--after <block>] --yes');
   const p = await Page.open(page);
   try {
-    const r = await getBlocks(p);
+    const r = await pageBlocks(p);
     const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
-    if (needYes(a, 'add a text block after "' + (after ? after.text.slice(0, 40) : '?') + '" on "' + r.title + '":\n' + text)) return;
-    await newBlockAfter(p, after);
+    if (!after) throw new CtlError('page has no blocks to add after');
+    if (needYes(a, 'add a text block after ' + after.type + ' "' + after.text.slice(0, 40) + '" on "' + r.title + '":\n' + text)) return;
+    await emptyBlockAfter(p, r.blocks, after);
     const lines = String(text).split('\n');
     for (let i = 0; i < lines.length; i++) { if (i) await p.key('Enter'); if (lines[i]) await p.insertText(lines[i]); }
     await sleep(500);
     await p.mouseAway();
-    out(a, await getBlocks(p), 'added.\n' + listTop(await getBlocks(p)));
+    const r2 = await pageBlocks(p);
+    out(a, r2, 'added.\n' + listTop(r2));
   } finally { p.close(); }
 }
 
@@ -576,7 +647,7 @@ async function cmdImage(a) {
   const sub = a._[1];
   const p = await Page.open(a._[2]);
   try {
-    const r = await getBlocks(p, true);
+    const r = await pageBlocks(p, true);
     const imgs = r.blocks.filter((b) => b.type === 'image');
     if (sub === 'list') {
       return out(a, imgs, imgs.length ? imgs.map((b, i) => (i + 1) + '. ' + b.id.slice(-8) + '  ' + (b.size || []).join('x')).join('\n') : 'no images');
@@ -586,6 +657,7 @@ async function cmdImage(a) {
       const b = /^\d+$/.test(ref) ? imgs[Number(ref) - 1] : resolveBlock(imgs, ref);
       if (!b) throw new CtlError('no image ' + ref + ' (page has ' + imgs.length + ')');
       await p.mouseAway();
+      await reveal(p, b.id);
       const rect = await p.eval(String(function (id) { const im = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"] img')].find((x) => x.naturalWidth) || document.querySelector('.notion-page-content [data-block-id="' + id + '"] img'); im.scrollIntoView({ block: 'center' }); const q = im.getBoundingClientRect(); return { x: q.left, y: q.top, w: q.width, h: q.height, nw: im.naturalWidth }; }), b.id);
       await sleep(400);
       const scale = rect.nw && rect.w ? Math.max(1, Math.min(3, rect.nw / rect.w)) : 1;
@@ -602,21 +674,15 @@ async function cmdImage(a) {
       const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' }[ext];
       if (!mime) throw new CtlError('unsupported image type: ' + ext);
       const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
-      if (needYes(a, 'upload ' + path.basename(file) + ' as an image block after "' + (after ? after.text.slice(0, 40) : '?') + '" on "' + r.title + '"')) return;
-      await newBlockAfter(p, after);
-      const b64 = fs.readFileSync(file).toString('base64');
-      const ok = await p.eval(String(function (b64, name, mime) {
-        const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-        const dt = new DataTransfer(); dt.items.add(new File([u], name, { type: mime }));
-        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
-        document.activeElement.dispatchEvent(ev); return ev.defaultPrevented;
-      }), b64, path.basename(file), mime);
-      if (!ok) throw new CtlError('Notion ignored the paste');
-      const before = imgs.length;
-      const done = await waitFor(async () => { const x = (await getBlocks(p, true)).blocks.filter((b) => b.type === 'image'); return x.length > before && x.every((i) => i.size && i.size[0] > 1) ? x : null; }, 30000, 700);
-      if (!done) throw new CtlError('image block did not finish uploading within 30s');
+      if (!after) throw new CtlError('page has no blocks to add after');
+      if (needYes(a, 'upload ' + path.basename(file) + ' as an image block after ' + after.type + ' "' + after.text.slice(0, 40) + '" on "' + r.title + '"')) return;
+      const nb = await emptyBlockAfter(p, r.blocks, after);
+      await pasteFile(p, file, mime);
+      // a grey placeholder shows first; large images can take a minute or more
+      const done = await waitFor(async () => { const x = (await getBlocks(p, true)).blocks.find((b) => b.type === 'image' && !r.blocks.some((o) => o.id === b.id)); return x && x.size && x.size[0] > 1 ? x : null; }, 120000, 1000);
+      if (!done) throw new CtlError('image block was added but did not finish uploading within 120s; check the page later');
       await p.mouseAway();
-      const r2 = await getBlocks(p);
+      const r2 = await pageBlocks(p);
       return out(a, r2, 'uploaded.\n' + listTop(r2));
     }
     throw new CtlError('usage: notionctl image list|read|add <page> ...');
@@ -730,6 +796,253 @@ async function cmdDb(a) {
   } finally { p.close(); }
 }
 
+async function cmdFile(a) {
+  const [, sub, page, file] = a._;
+  if (sub !== 'add' || !file) throw new CtlError('usage: notionctl file add <page> <file> [--after <block>] --yes');
+  if (!fs.existsSync(file)) throw new CtlError('no such file: ' + file);
+  const ext = path.extname(file).slice(1).toLowerCase();
+  const mime = MIME[ext] || 'application/octet-stream';
+  const name = path.basename(file);
+  const p = await Page.open(page);
+  try {
+    const r = await pageBlocks(p, true);
+    const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
+    if (!after) throw new CtlError('page has no blocks to add after');
+    if (needYes(a, 'upload ' + name + ' (' + mime + ', ' + fs.statSync(file).size + ' bytes) as a file block after ' + after.type + ' "' + after.text.slice(0, 40) + '" on "' + r.title + '"')) return;
+    const seen = new Set(r.blocks.map((b) => b.id));
+    await emptyBlockAfter(p, r.blocks, after);
+    await pasteFile(p, file, mime);
+    // done when a new block shows the file name and a size (e.g. "154.5 KiB")
+    const done = await waitFor(async () => p.eval(String(function (seen, name) {
+      for (const b of document.querySelectorAll('.notion-page-content [data-block-id]')) {
+        if (seen.includes(b.dataset.blockId) || b.classList.contains('notion-selectable-drag-handle')) continue;
+        const t = b.innerText || '';
+        if (t.includes(name) && /\d\s?(B|KiB|MiB|GiB|KB|MB|GB)\b/.test(t) && !/Uploading|Loading/i.test(t)) return { id: b.dataset.blockId, text: t.replace(/\s+/g, ' ').trim() };
+      }
+      return null;
+    }), [...seen], name), 60000, 700);
+    if (!done) throw new CtlError('file block did not finish uploading within 60s; check the page');
+    await p.mouseAway();
+    const r2 = await pageBlocks(p);
+    out(a, { uploaded: done, blocks: r2.blocks }, 'uploaded ' + done.text + '\n' + listTop(r2));
+  } finally { p.close(); }
+}
+
+async function waitLoaded(p, id) {
+  return waitFor(async () => {
+    try {
+      return await p.eval(String(function (id) {
+        const here = location.href.split('?')[0].replace(/-/g, '').toLowerCase();
+        if (id && !here.endsWith(id)) return null;
+        return document.querySelector('.notion-page-content, .notion-collection_view_page-block, .notion-frame') ? { url: location.href.split('?')[0], title: document.title } : null;
+      }), id);
+    } catch { return null; }
+  }, 20000, 400);
+}
+
+async function cmdOpen(a) {
+  await requireCdp();
+  const [, target, child] = a._;
+  if (child != null) {
+    // open <tab> <block>: follow the page link inside a block of an open page (same tab)
+    const p = await Page.open(target);
+    try {
+      const r = await pageBlocks(p, true);
+      const b = resolveBlock(r.blocks, child);
+      await reveal(p, b.id);
+      const pt = await p.eval(String(function (id) {
+        for (const el of document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"]')) {
+          const l = el.querySelector('a[href^="/"]');
+          if (l) { l.scrollIntoView({ block: 'center' }); const q = l.getBoundingClientRect(); return { x: q.left + Math.min(40, q.width / 2), y: q.top + q.height / 2, href: l.getAttribute('href') }; }
+        }
+        return null;
+      }), b.id);
+      if (!pt) throw new CtlError(b.type + ' "' + b.text.slice(0, 40) + '" has no page link to open');
+      await p.click(pt);
+      const ok = await waitLoaded(p, pageIdOf(pt.href));
+      if (!ok) throw new CtlError('the tab did not move to ' + pt.href);
+      return out(a, ok, 'opened ' + ok.title + '  ' + ok.url);
+    } finally { p.close(); }
+  }
+  const id = pageIdOf(target);
+  if (!id) throw new CtlError('usage: notionctl open <url|page id> [--in <tab>]   or   notionctl open <tab> <block with a page link>');
+  const tabs = await targets();
+  const already = tabs.find((t) => pageIdOf(t.url) === id);
+  if (already) return out(a, { url: already.url.split('?')[0], title: already.title, already: true }, 'already open: ' + already.title + '  ' + already.url.split('?')[0]);
+  const tab = a.in ? await findTab(a.in) : tabs.find((t) => t.url.endsWith('/blank'));
+  if (!tab) throw new CtlError('no blank tab to use; give --in <tab> (that tab leaves its current page). Open tabs:\n' + tabs.map((t) => '  ' + (t.title || '(not loaded)') + '  ' + t.url.split('?')[0]).join('\n'));
+  const p = new Page(tab);
+  await p.connect();
+  try {
+    await p.send('Page.navigate', { url: 'https://app.notion.com/p/' + id });
+    const ok = await waitLoaded(p, id);
+    if (!ok) throw new CtlError('page did not load in 20s (no access in this Notion account, or a wrong id?)');
+    out(a, ok, 'opened ' + ok.title + '  ' + ok.url + (a.in ? '' : '  (in the blank tab)'));
+  } finally { p.close(); }
+}
+
+// Hover the block, click its drag handle ("Drag to move, click to open menu") and return the menu items.
+async function openBlockMenu(p, b) {
+  await reveal(p, b.id);
+  const at = await p.eval(String(function (id) {
+    const el = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"]')].find((x) => !x.classList.contains('notion-selectable-drag-handle'));
+    const q = el.getBoundingClientRect(); return { x: q.left + 30, y: q.top + Math.min(12, q.height / 2) };
+  }), b.id);
+  await p.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y });
+  await sleep(600);
+  // the visible handle closest to the hovered row (hidden handles of other blocks can stay in the DOM)
+  const h = await waitFor(() => p.eval(String(function (y) {
+    const hs = [...document.querySelectorAll('[role=button]')].filter((x) => (x.getAttribute('aria-label') || '').startsWith('Drag to move')).map((e) => {
+      const q = e.getBoundingClientRect(); const c = { x: q.left + q.width / 2, y: q.top + q.height / 2 };
+      return { ...c, ok: q.width > 0 && getComputedStyle(e).opacity !== '0', d: Math.abs(c.y - y) };
+    }).filter((c) => c.ok && c.d < 40).sort((m, n) => m.d - n.d);
+    return hs[0] || null;
+  }), at.y), 2000, 200);
+  if (!h) throw new CtlError('block handle did not appear on hover');
+  for (let k = 1; k <= 6; k++) { await p.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x + (h.x - at.x) * k / 6, y: at.y + (h.y - at.y) * k / 6 }); await sleep(60); }
+  await sleep(200);
+  await p.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: h.x, y: h.y, button: 'left', buttons: 1, clickCount: 1 });
+  await sleep(80);
+  await p.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: h.x, y: h.y, button: 'left', buttons: 0, clickCount: 1 });
+  const open = await waitFor(() => p.eval(String(function () { return document.querySelectorAll('.notion-overlay-container [role=menuitem], .notion-overlay-container [role=option]').length > 3; })), 3000, 200);
+  if (!open) throw new CtlError('the block menu did not open');
+}
+
+const JS_MENU_ITEM = String(function (label) {
+  const items = [...document.querySelectorAll('.notion-overlay-container [role=menuitem], .notion-overlay-container [role=option]')];
+  const names = items.map((e) => e.innerText.trim().split('\n')[0]);
+  const i = names.indexOf(label);
+  if (i < 0) return { items: names.filter(Boolean) };
+  const q = items[i].getBoundingClientRect(); return { x: q.left + q.width / 2, y: q.top + q.height / 2 };
+});
+
+async function cmdDelete(a) {
+  const [, page, ref] = a._;
+  if (!ref) throw new CtlError('usage: notionctl delete <page> <block> --yes');
+  const p = await Page.open(page);
+  try {
+    const r = await pageBlocks(p, true);
+    const b = resolveBlock(r.blocks, ref);
+    if (needYes(a, 'delete ' + b.type + ' "' + b.text.slice(0, 50) + '" (' + b.id.slice(-8) + ') on "' + r.title + '"' + (b.type === 'page' ? ' - this moves the sub-page to Trash' : ''))) return;
+    let gone = false;
+    for (let attempt = 0; attempt < 2 && !gone; attempt++) {   // the first click sometimes lands while the menu is still animating
+      await openBlockMenu(p, b);
+      await sleep(300);
+      const it = await p.eval(JS_MENU_ITEM, 'Delete');
+      if (!it || it.items) { await p.key('Escape'); throw new CtlError('no "Delete" in the block menu; menu shows: ' + ((it && it.items) || []).join(', ')); }
+      await p.click(it);
+      gone = await waitFor(async () => !(await getBlocks(p, true)).blocks.some((x) => x.id === b.id), 4000, 300);
+      if (!gone) { await p.key('Escape'); await sleep(400); }
+    }
+    if (!gone) throw new CtlError('block is still there after Delete; check the page');
+    await p.mouseAway();
+    const r2 = await pageBlocks(p);
+    out(a, { deleted: b.id, blocks: r2.blocks }, 'deleted ' + b.id.slice(-8) + '\n' + listTop(r2));
+  } finally { p.close(); }
+}
+
+// ---- workspaces: the switcher menu at the top/bottom of the sidebar ----
+
+const JS_SWITCHER = String(function () {
+  const b = document.querySelector('.notion-sidebar-switcher') ||
+    [...document.querySelectorAll('.notion-sidebar [role=button][aria-haspopup=dialog]')].find((e) => e.getBoundingClientRect().width > 150 && e.innerText.trim());
+  if (!b) return null;
+  const q = b.getBoundingClientRect();
+  if (!q.width || q.left < 0) return { hidden: true };
+  return { x: q.left + q.width / 2, y: q.top + q.height / 2, name: b.innerText.trim().split('\n').filter((l) => l.length > 1).pop() || '' };
+});
+
+// Accounts and their workspaces as the open switcher menu lists them, in order.
+const JS_WORKSPACES = String(function () {
+  const o = document.querySelector('.notion-overlay-container');
+  const dlg = o && [...o.querySelectorAll('[role=dialog]')].pop();
+  if (!dlg) return null;
+  const lines = dlg.innerText.split('\n').map((l) => l.trim()).filter(Boolean);
+  const out = { current: lines.filter((l) => l.length > 1)[0] || '', accounts: [] };
+  let acc = null; let idx = -1;
+  for (const e of dlg.querySelectorAll('[role=menuitem], [aria-label="Account options"]')) {
+    if (e.getAttribute('role') === 'menuitem') idx++;
+    if (e.getAttribute('aria-label') === 'Account options') {
+      const by = e.getBoundingClientRect().top + e.getBoundingClientRect().height / 2;
+      const em = [...dlg.querySelectorAll('*')].filter((x) => !x.children.length && /\S+@\S+\.\S+/.test(x.textContent))
+        .map((x) => ({ t: x.textContent.trim(), d: Math.abs(x.getBoundingClientRect().top + x.getBoundingClientRect().height / 2 - by) })).sort((m, n) => m.d - n.d)[0];
+      const email = em && em.d < 24 ? em.t : '';
+      acc = { email, workspaces: [] }; out.accounts.push(acc); continue;
+    }
+    const ls = e.innerText.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (!acc || ls.includes('Add workspace')) continue;
+    const guest = ls.includes('Guest');
+    const name = ls.filter((l) => l !== 'Guest' && l.length > 1 && !/^\p{Extended_Pictographic}/u.test(l)).pop() || ls[ls.length - 1];
+    const q = e.getBoundingClientRect();
+    acc.workspaces.push({ name, guest, idx });
+  }
+  return out;
+});
+
+async function visibleTab() {
+  for (const t of await targets()) {
+    const p = new Page(t);
+    try { await p.connect(); if ((await p.eval(String(function () { return document.visibilityState; }))) === 'visible') return t; } catch {} finally { p.close(); }
+  }
+  return null;
+}
+
+async function cmdWorkspace(a) {
+  await requireCdp();
+  const want = a._[1];
+  const tab = a.in ? await findTab(a.in) : await visibleTab();
+  if (!tab) throw new CtlError('no Notion tab is visible; bring Notion\'s window up once (it can stay behind other apps)');
+  const p = new Page(tab);
+  await p.connect();
+  try {
+    const sw = await p.eval(JS_SWITCHER);
+    if (!sw) throw new CtlError('workspace switcher not found in the sidebar');
+    if (sw.hidden) throw new CtlError('tab "' + tab.title + '" is in the background; Notion lays out only the shown tab. Click it in Notion, or leave out --in to use the shown tab');
+    await p.click(sw);
+    const ws = await waitFor(() => p.eval(JS_WORKSPACES), 3000, 200);
+    if (!ws) throw new CtlError('the workspace menu did not open');
+    if (!want) {
+      await p.key('Escape');
+      const text = 'tab: ' + tab.title + '\ncurrent: ' + ws.current + '\n' + ws.accounts.map((ac) => ac.email + '\n' + ac.workspaces.map((w) => '  ' + (w.name === ws.current ? '* ' : '  ') + w.name + (w.guest ? '  (guest)' : '')).join('\n')).join('\n');
+      return out(a, { tab: tab.title, current: ws.current, accounts: ws.accounts.map((ac) => ({ email: ac.email, workspaces: ac.workspaces.map(({ name, guest }) => ({ name, guest })) })) }, text);
+    }
+    let cands = [];
+    for (const ac of ws.accounts) for (const w of ac.workspaces) cands.push({ ...w, email: ac.email });
+    if (a.account) cands = cands.filter((w) => w.email.toLowerCase().includes(a.account.toLowerCase()));
+    let hits = cands.filter((w) => w.name === want);
+    if (!hits.length) hits = cands.filter((w) => w.name.toLowerCase() === String(want).toLowerCase());
+    if (!hits.length) hits = cands.filter((w) => w.name.toLowerCase().includes(String(want).toLowerCase()));
+    if (hits.length !== 1) {
+      await p.key('Escape');
+      throw new CtlError((hits.length ? '"' + want + '" matches ' + hits.length + ' workspaces; add --account <email>:\n' : 'no workspace matches "' + want + '":\n') +
+        (hits.length ? hits : cands).map((w) => '  ' + w.name + (w.guest ? ' (guest)' : '') + '  ' + w.email).join('\n'));
+    }
+    const w = hits[0];
+    const url0 = await p.eval(String(function () { return location.href; }));
+    // long menus scroll: bring the item into view before clicking it
+    const pt = await p.eval(String(function (i) {
+      const o = document.querySelector('.notion-overlay-container'); const dlg = o && [...o.querySelectorAll('[role=dialog]')].pop();
+      const e = dlg && dlg.querySelectorAll('[role=menuitem]')[i]; if (!e) return null;
+      e.scrollIntoView({ block: 'center' }); const q = e.getBoundingClientRect();
+      return q.top >= 0 && q.bottom <= innerHeight ? { x: q.left + q.width / 2, y: q.top + q.height / 2 } : null;
+    }), w.idx);
+    if (!pt) { await p.key('Escape'); throw new CtlError('could not scroll "' + w.name + '" into view in the menu'); }
+    await sleep(250);
+    await p.click(pt);
+    const done = await waitFor(async () => {
+      try {
+        const s = await p.eval(JS_SWITCHER); const u = await p.eval(String(function () { return location.href; }));
+        return s && !s.hidden && s.name === w.name && (u !== url0 || ws.current === w.name) ? { url: u.split('?')[0], title: await p.eval(String(function () { return document.title; })) } : null;
+      } catch { return null; }
+    }, 15000, 500);
+    if (!done) { await p.key('Escape'); throw new CtlError('the tab did not switch to "' + w.name + '" within 15s; check Notion'); }
+    await sleep(1200);   // the document title follows the page a moment later
+    done.title = await p.eval(String(function () { return document.title; }));
+    done.url = (await p.eval(String(function () { return location.href; }))).split('?')[0];
+    out(a, { workspace: w.name, account: w.email, ...done }, 'switched tab to ' + w.name + (w.guest ? ' (guest)' : '') + ' [' + w.email + ']\n' + done.title + '  ' + done.url);
+  } finally { p.close(); }
+}
+
 async function cmdScreenshot(a) {
   const p = await Page.open(a._[1]);
   try {
@@ -748,9 +1061,9 @@ async function main() {
   const a = parseArgs(process.argv.slice(2));
   const cmd = a._[0];
   if (!cmd || a.help) { console.log(HELP); return; }
-  const table = { launch: cmdLaunch, status: cmdStatus, blocks: cmdBlocks, read: cmdRead, move: cmdMove, edit: cmdEdit, append: cmdAppend, image: cmdImage, db: cmdDb, screenshot: cmdScreenshot };
+  const table = { launch: cmdLaunch, status: cmdStatus, open: cmdOpen, file: cmdFile, delete: cmdDelete, workspace: cmdWorkspace, blocks: cmdBlocks, read: cmdRead, move: cmdMove, edit: cmdEdit, append: cmdAppend, image: cmdImage, db: cmdDb, screenshot: cmdScreenshot };
   if (!table[cmd]) throw new CtlError('unknown command: ' + cmd + '\n' + HELP);
-  if (!['launch', 'status'].includes(cmd) && !a._[cmd === 'image' || cmd === 'db' ? 2 : 1]) throw new CtlError('missing <page> (URL, page id or tab title)');
+  if (!['launch', 'status', 'workspace'].includes(cmd) && !a._[['image', 'db', 'file'].includes(cmd) ? 2 : 1]) throw new CtlError('missing <page> (URL, page id or tab title)');
   await table[cmd](a);
 }
 
