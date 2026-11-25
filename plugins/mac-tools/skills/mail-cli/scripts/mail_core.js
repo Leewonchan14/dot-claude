@@ -219,6 +219,14 @@ function locateAfterMove(dest, acc, mid, oldId, date) {
   return null;
 }
 
+// Gmail keeps every message in All Mail and shows INBOX as a label. Mail.app's direct
+// INBOX -> All Mail move leaves the Inbox label on the server, so the message comes back
+// to INBOX on the next sync (~15 s). Going through the trash drops every label first;
+// moving it out of the trash into All Mail then leaves it archived with no Inbox label.
+const ALL_MAIL = ['전체보관함', 'all mail', '[gmail]/all mail'];
+function isAllMail(mb) { return ALL_MAIL.indexOf(lc(mb.name)) >= 0; }
+function isTrash(mb) { return ROLES.trash.some(c => lc(c) === lc(mb.name)); }
+
 function moveRefs(req, destFor) {
   const results = [];
   for (const ref of req.refs || []) {
@@ -228,9 +236,24 @@ function moveRefs(req, destFor) {
       const target = destFor(x);
       d.to = target.acc.name + ':' + target.mb.name;
       if (target.acc.name === x.acc.name && target.mb.name === x.mb.name) { d.status = 'skipped (already there)'; results.push(d); continue; }
+      const viaTrash = target.acc.name === x.acc.name && isAllMail(target.mb) && !isTrash(x.mb)
+        ? resolveMailbox(x.acc, 'trash', true) : null;
+      if (viaTrash) d.via = x.acc.name + ':' + viaTrash.name;
       if (req.dryRun) { d.status = 'dry-run'; results.push(d); continue; }
-      Mail.move(x.msg, { to: target.mb.spec });
-      d.newRef = locateAfterMove(target.mb, target.acc, d.messageId, x.id, d.date);
+      let msg = x.msg, fromId = x.id;
+      if (viaTrash) {
+        Mail.move(msg, { to: viaTrash.spec });
+        const tref = locateAfterMove(viaTrash, x.acc, d.messageId, x.id, d.date);
+        if (!tref) {
+          d.status = 'error';
+          d.error = 'moved to ' + d.via + ' but could not find it there; finish with: mailctl move <' + d.via + ' ref> --to ' + target.mb.name;
+          results.push(d); continue;
+        }
+        fromId = Number(tref.split(':').pop());
+        msg = viaTrash.spec.messages.byId(fromId);
+      }
+      Mail.move(msg, { to: target.mb.spec });
+      d.newRef = locateAfterMove(target.mb, target.acc, d.messageId, fromId, d.date);
       d.status = d.newRef ? 'moved' : 'moved (new id not found yet; look up by Message-Id)';
       results.push(d);
     } catch (e) {

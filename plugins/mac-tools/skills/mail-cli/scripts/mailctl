@@ -379,6 +379,8 @@ def print_results(rows):
             continue
         extra = f" → {r['newRef']}" if r.get("newRef") else ""
         dest = r.get("to") or r.get("action", "")
+        if r.get("via"):
+            dest += f" (via {r['via'].split(':', 1)[-1]})"
         print(f"{'✓' if not r['status'].startswith('dry') else '·'} [{r['status']}] {r['subject']} — {sender_name(r['from'])}  {r['ref']} ⇒ {dest}{extra}")
 
 

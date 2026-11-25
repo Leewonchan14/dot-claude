@@ -17,7 +17,7 @@ macOS Mail.app을 osascript(JXA)로 읽고, 검색하고, 옮기는 CLI. **보�
 | `count [-a] [-m]` | 메일함별 전체/안읽음 수와 합계 |
 | `list` / `search` | 최신순 목록. 필터: `-q`(제목·보낸이), `--from`, `--subject`, `--body`(느림), `--since 7d`, `--before`, `--unread`, `--flagged`, `-n 20`, `--snippet`, `--refs` |
 | `read REF [--headers] [--source]` | 메일 하나 보기 (본문 기본 4000자) |
-| `archive REF…` | 계정의 보관 메일함으로 이동 (IMAP: Archive 폴더, Gmail: 전체보관함) |
+| `archive REF…` | 계정의 보관 메일함으로 이동 (IMAP: Archive 폴더, Gmail: 휴지통을 거쳐 전체보관함) |
 | `trash REF…` | 계정의 휴지통으로 이동 (Gmail: 휴지통, IMAP: Deleted Messages 등) |
 | `inbox REF…` | INBOX로 되돌리기 |
 | `move REF… --to 메일함` | 이름, role, 또는 `계정:메일함`으로 이동 |
@@ -29,6 +29,7 @@ macOS Mail.app을 osascript(JXA)로 읽고, 검색하고, 옮기는 CLI. **보�
 - 이동 명령은 모두 `--dry-run`을 지원하고, refs 자리에 `-`를 주면 stdin에서 읽는다
 - **REF** = `계정:메일함:id` (예: `Personal:INBOX:41666`, `Personal`은 Mail.app의 계정 이름) 또는 Message-Id. 이동하면 id가 바뀌므로 결과에 새 ref(`→ …`)를 출력한다
 - Gmail은 같은 메일이 INBOX·전체보관함·중요에 같은 id로 보이므로, 검색 결과에서 계정+id 기준으로 한 줄로 합친다 (`alsoIn`)
+- Gmail 전체보관함으로 옮길 때(`archive`, `move --to 전체보관함`)는 메일마다 INBOX → 휴지통 → 전체보관함으로 옮긴다. Mail.app에서 바로 옮기면 서버의 Inbox 라벨이 남아 다음 동기화 때 INBOX로 돌아온다. 휴지통에서 꺼낼 때 라벨이 모두 빠진다
 
 ## 예시
 

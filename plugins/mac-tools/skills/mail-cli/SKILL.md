@@ -2,7 +2,7 @@
 name: mail-cli
 description: Use when reading, searching, triaging, archiving or moving mail in the macOS Mail.app accounts (Gmail, Google Workspace, IMAP) from the command line with `mailctl` — inbox counts, newest-N lists, per-category grouping, one-line summaries, search by sender/subject/body/date (including archived mail), archive/trash/move, unsubscribe candidates. Triggers: "메일 리스트업", "인박스 몇 개", "메일 분류", "메일 아카이브", "보관된 메일에서 찾아", "수신 거부할 메일", "Mail 앱", "mail inbox". No sending.
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
   date: "2026-11-25"
 ---
 
@@ -34,7 +34,7 @@ parses local `.emlx` files for body text, and drives Mail.app through osascript 
 | `mailctl read REF [--headers] [--source]` | read | One message, body capped at 4000 chars |
 | `mailctl senders` | read | Group by sender (count, unread, latest subject, refs) |
 | `mailctl unsubscribe [--scan 50]` | read | Senders whose mail has List-Unsubscribe, with the link |
-| `mailctl archive REF…` | write | Move to the account's archive (IMAP: `Archive` folder, Gmail: 전체보관함) |
+| `mailctl archive REF…` | write | Move to the account's archive (IMAP: `Archive` folder, Gmail: 전체보관함 via 휴지통) |
 | `mailctl trash REF…` | write | Move to the account's trash (Gmail: 휴지통, IMAP: e.g. Deleted Messages) |
 | `mailctl inbox REF…` | write | Move back to INBOX |
 | `mailctl move REF… --to BOX` | write | Move to a mailbox name, role, or `Account:Mailbox` |
@@ -50,6 +50,9 @@ Common options: `-a` account name or address (comma list), `-m` mailbox name, ro
   or search again, before acting on the message a second time.
 - Gmail shows one message in INBOX, 전체보관함 and 중요 with the same id. Results are merged into
   one row (`alsoIn` in JSON).
+- Gmail archive (`archive`, or `move --to 전체보관함`) goes INBOX → 휴지통 → 전체보관함 for each message.
+  A direct move leaves the server's Inbox label and the message is back in INBOX after the next sync.
+  Check again after about a minute (`-m inbox,휴지통`); if it sits in 휴지통, move it to 전체보관함 again.
 - `unread` counts messages whose read flag is off. Mail's sidebar badge can show a smaller number.
 
 ## Rules

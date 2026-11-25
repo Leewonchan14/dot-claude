@@ -2,7 +2,7 @@
 name: mail-archiving
 description: The user's own rules for archiving, moving and tidying Mail.app mail with mailctl. Use together with mail-cli whenever the user says 아카이브/아카이빙/보관/archive, "정리해줘" about mail, "All Mail로", "휴지통으로", asks to move mail between mailboxes, or asks to 정리/요약해서 파일로 만들어 about mail. Covers which mailbox is the archive per account, what needs approval, dry-run first, ids after moves, result limits, Markdown summaries, and raw-source reads.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   date: "2026-11-25"
 ---
 
@@ -51,10 +51,13 @@ metadata:
 
 ### 2-3. Gmail 전체보관함(All Mail)으로 보내기
 
-- `mailctl archive REF…`(보관 폴더가 없는 Gmail 계정) 또는 `mailctl move REF… --to 전체보관함`으로 **바로** 옮긴다.
-  INBOX에서 빠지고 전체보관함에만 남는다.
-- **휴지통을 거치지 않는다.** `INBOX → Trash → Archive`처럼 휴지통을 거쳐 옮기면 원래 휴지통에 있던 메일까지
-  같이 옮겨질 수 있다. mailctl에서는 쓰지 않는다.
+- `mailctl archive REF…`(보관 폴더가 없는 Gmail 계정) 또는 `mailctl move REF… --to 전체보관함`을 쓴다.
+  mailctl이 그 메일만 **INBOX → 휴지통 → 전체보관함** 순서로 옮긴다. 출력에 `(via 휴지통)`이 붙는다.
+- 받은 편지함에서 전체보관함으로 **바로** 옮기면 서버의 Inbox 라벨이 남아, 15초쯤 뒤 동기화 때 INBOX로 돌아온다.
+  그래서 휴지통을 거친다. 메일을 하나씩 지정해서 옮기므로 원래 휴지통에 있던 다른 메일은 건드리지 않는다.
+- 옮긴 뒤 1분쯤 지나서 INBOX와 휴지통을 다시 검색해 확인한다:
+  `mailctl search --from 보낸이 -m inbox,휴지통 -a 계정`. 휴지통에 남아 있으면
+  `mailctl move <휴지통 ref> --to 전체보관함`으로 한 번 더 옮긴다. 휴지통 메일은 30일 뒤 지워지므로 그대로 두지 않는다.
 
 ## 3. 승인
 
