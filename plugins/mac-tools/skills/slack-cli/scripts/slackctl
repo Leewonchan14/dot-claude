@@ -22,6 +22,8 @@ Examples
   slackctl schedule @me 14:05 "text" --yes
   slackctl react general 1700000000.123456 white_check_mark --yes
   slackctl react general 1700000000.123456 eyes --remove --yes
+  slackctl reactions general 1700000000.123456      # who reacted (via ego-browser)
+  slackctl read general -n 10 --who
 """
 import argparse
 import hashlib
@@ -239,6 +241,108 @@ def reactions_in(sub):
     return out
 
 
+# ---------------- who reacted (ego-browser) ----------------
+# The desktop app shows reactors only in a hover tooltip, which AX cannot open. The Slack web client in
+# ego-browser (the user's logged-in browser) shows the same tooltip on a synthetic CDP hover, without
+# touching the desktop app or the real mouse. No token or cookie is read.
+
+EGO_JS = r"""
+const P = __PARAMS__;
+const task = await taskSpace("slackctl reactions " + Date.now());
+const out = { team: P.team, results: [] };
+try {
+  const page = task.page("p1");
+  if (!out.team) {
+    await page.goto("https://app.slack.com/client/", { timeout: 30000 });
+    await page.waitForURL(/\/client\/T[A-Z0-9]+/, { timeout: 30000 });
+    out.team = (await page.url()).match(/\/client\/(T[A-Z0-9]+)/)[1];
+  }
+  const base = "https://app.slack.com/client/" + out.team + "/" + P.channel;
+  await page.goto(P.parent ? base + "/thread/" + P.channel + "-" + P.parent : base, { timeout: 30000 });
+  for (const ts of P.items) {
+    const msel = P.parent ? '[id="' + P.channel + "-" + P.parent + "-thread-list-Thread_" + ts + '"]' : '[id="message-list_' + ts + '"]';
+    try { await page.waitForSelector(msel, { timeout: 20000 }); }
+    catch (e) { out.results.push({ ts, error: "message not rendered in the web client" }); continue; }
+    await page.waitForTimeout(1500);  // a freshly loaded client ignores the first hover
+    const n = await page.evaluate((s) => document.querySelectorAll(s + " .c-reaction").length, msel);
+    const tips = [];
+    for (let k = 0; k < n; k++) {
+      let tip = "";
+      for (let attempt = 0; attempt < 3 && !tip; attempt++) {
+        await page.hover(msel + " .c-reaction >> nth=" + k, { label: "read who reacted" });
+        await page.waitForFunction(() => /reacted with/.test(document.querySelector(".c-tooltip__tip")?.innerText || ""), undefined, { timeout: 3000 }).catch(() => {});
+        tip = await page.evaluate(() => document.querySelector(".c-tooltip__tip")?.innerText || "");
+        await page.mouse.move(2, 300);
+        await page.waitForFunction(() => !document.querySelector(".c-tooltip__tip"), undefined, { timeout: 3000 }).catch(() => {});
+      }
+      tips.push(tip);
+    }
+    out.results.push({ ts, tips });
+  }
+} catch (e) {
+  out.error = String(e && e.message || e).slice(0, 300);
+} finally {
+  await task.finish({ keep: [] });
+}
+console.log("SLACKCTL_JSON " + JSON.stringify(out));
+"""
+
+TEAM_FILE = os.path.join(CACHE, "team")
+TIP = re.compile(r"^(?P<who>.+?) reacted with :(?P<emoji>[^:\s]+):\s*$", re.S)
+
+
+def parse_tip(text):
+    m = TIP.match(" ".join((text or "").split()))
+    if not m:
+        return None
+    who = re.sub(r"\s*\(click to remove\)", "", m.group("who"))
+    who = re.split(r",\s+(?:and\s+)?|\s+and\s+", who)
+    return {"emoji": m.group("emoji"), "users": [w.strip() for w in who if w.strip()]}
+
+
+def who_reacted(channel, ts_list, parent=None):
+    """{ts: [{emoji, users}]} for messages of one channel (or one thread), read from the web client."""
+    team = open(TEAM_FILE).read().strip() if os.path.exists(TEAM_FILE) else None
+    params = {"team": team, "channel": channel, "parent": parent, "items": ts_list}
+    script = EGO_JS.replace("__PARAMS__", json.dumps(params))
+    try:
+        r = subprocess.run(["ego-browser", "nodejs"], input=script, capture_output=True, text=True, timeout=60 + 25 * len(ts_list))
+    except FileNotFoundError:
+        raise SlackError("ego-browser is not installed; it is needed to see who reacted")
+    m = re.search(r"SLACKCTL_JSON (\{.*\})", r.stdout + "\n" + r.stderr)  # ego-browser prints console.log to stderr
+    if not m:
+        raise SlackError("ego-browser gave no result: " + (r.stdout + r.stderr).strip()[-600:])
+    data = json.loads(m.group(1))
+    if data.get("error"):
+        raise SlackError("ego-browser: " + data["error"] + " (is Slack signed in there? open app.slack.com in ego-browser)")
+    if data.get("team") and data["team"] != team:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(TEAM_FILE, "w") as fh:
+            fh.write(data["team"])
+    out = {}
+    for res in data["results"]:
+        out[res["ts"]] = {"error": res["error"]} if res.get("error") else [parse_tip(t) or {"raw": t} for t in res["tips"]]
+    return out
+
+
+def attach_who(msgs, channel, parent=None):
+    targets = [m["ts"] for m in msgs if m.get("reactions")]
+    if not targets:
+        return
+    who = who_reacted(channel, targets, parent)
+    for m in msgs:
+        got = who.get(m["ts"])
+        if isinstance(got, dict):
+            m["whoError"] = got["error"]
+        elif got:
+            for k, r in enumerate(m["reactions"]):
+                # Same order on desktop and web; the tooltip also gives the exact shortcode.
+                hit = got[k] if k < len(got) and "emoji" in got[k] else None
+                hit = hit or next((g for g in got if emoji_key(g.get("emoji")) == emoji_key(r["emoji"])), None)
+                if hit:
+                    r["emoji"], r["users"] = hit["emoji"], hit["users"]
+
+
 def message_nodes(nodes, thread=False):
     out = []
     pat = re.compile(r"-thread-list-Thread_(\d+\.\d+)$") if thread else re.compile(r"^message-list_(\d+\.\d+)$")
@@ -410,11 +514,14 @@ def cmd_unread(a):
 
 
 def cmd_read(a):
-    open_conv(a.conversation)
+    row = open_conv(a.conversation)
     msgs = message_nodes(dump())
     for m in msgs:
         m.pop("i", None)
-    return {"conversation": view_name(), "messages": msgs[-a.limit:] if a.limit else msgs,
+    msgs = msgs[-a.limit:] if a.limit else msgs
+    if a.who:
+        attach_who(msgs, row["id"])
+    return {"conversation": view_name(), "messages": msgs,
             "note": "only messages Slack has rendered are visible (recent ones)"}
 
 
@@ -423,7 +530,40 @@ def cmd_thread(a):
     msgs = message_nodes(nodes, thread=True)
     for m in msgs:
         m.pop("i", None)
+    if a.who:
+        attach_who(msgs, conv_id(a.conversation), parent=a.ts)
     return {"conversation": view_name(), "thread": a.ts, "messages": msgs}
+
+
+def conv_id(query):
+    if ROW_ID.match(query):
+        return query
+    row = find_row(sidebar_rows(dump()), query)
+    if not row:
+        go_home()
+        row = find_row(sidebar_rows(dump()), query)
+    if not row:
+        raise SlackError(f"could not find the channel id of {query}; pass the id (C…/D…) instead")
+    return row["id"]
+
+
+def cmd_reactions(a):
+    if a.thread:
+        nodes = open_thread(a.conversation, a.thread)
+        msgs = message_nodes(nodes, thread=True)
+        channel = conv_id(a.conversation)
+    else:
+        row = open_conv(a.conversation)
+        msgs = message_nodes(dump())
+        channel = row["id"]
+    m = next((x for x in msgs if x["ts"] == a.ts), None)
+    if not m:
+        raise SlackError(f"message {a.ts} is not rendered")
+    m.pop("i", None)
+    if m["reactions"]:
+        attach_who([m], channel, parent=a.thread)
+    return {"conversation": view_name(), "ts": a.ts, "sender": m["sender"], "text": m["text"],
+            "reactions": m["reactions"], **({"whoError": m["whoError"]} if m.get("whoError") else {})}
 
 
 def activity_open(tab):
@@ -783,7 +923,12 @@ def cmd_forward(a):
 # ---------------- output ----------------
 
 def fmt_reactions(rs):
-    return ", ".join(f":{r['emoji']}: {r['count']}" + (" (you)" if r["me"] else "") for r in rs)
+    def one(r):
+        s = f":{r['emoji']}: {r['count']}"
+        if r.get("users"):
+            return s + " " + ", ".join(r["users"])
+        return s + (" (you)" if r["me"] else "")
+    return ", ".join(one(r) for r in rs) if not any(r.get("users") for r in rs) else " · ".join(one(r) for r in rs)
 
 
 def show(cmd, d):
@@ -809,6 +954,16 @@ def show(cmd, d):
             print(f"{m['time']}  {m['sender'] or '?'}: {m['text']}{extra}   ts={m['ts']}")
             if m.get("reactions"):
                 print("    reactions: " + fmt_reactions(m["reactions"]))
+            if m.get("whoError"):
+                print("    (who reacted: " + m["whoError"] + ")")
+    elif cmd == "reactions":
+        print(f"# {d['conversation']} · {d['ts']}  {d['sender'] or '?'}: {d['text'][:80]}")
+        if not d["reactions"]:
+            print("no reactions")
+        for r in d["reactions"]:
+            print(f":{r['emoji']}: {r['count']}  " + (", ".join(r["users"]) if r.get("users") else ("(you)" if r["me"] else "")))
+        if d.get("whoError"):
+            print("(who reacted: " + d["whoError"] + ")")
     elif cmd == "react" and "reactions" in d:
         print(("done" if d.get("changed") else "not changed") + (f": {d['note']}" if d.get("note") else ""))
         print("reactions: " + (fmt_reactions(d["reactions"]) or "none"))
@@ -837,7 +992,11 @@ def main():
     p = add("channels", help="sidebar conversations"); p.add_argument("--unread", action="store_true")
     add("unread", help="conversations with unread messages")
     p = add("read", help="recent messages of a channel or DM"); p.add_argument("conversation"); p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("--who", action="store_true", help="also show who reacted (Slack web client in ego-browser)")
     p = add("thread", help="messages of a thread"); p.add_argument("conversation"); p.add_argument("ts")
+    p.add_argument("--who", action="store_true", help="also show who reacted (Slack web client in ego-browser)")
+    p = add("reactions", help="who reacted to one message, per emoji (Slack web client in ego-browser)")
+    p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("--thread", help="parent ts when the message is a thread reply")
     p = add("activity", help="notifications; 'activity mark <id> read|unread'")
     p.add_argument("action", nargs="?", choices=["list", "mark"]); p.add_argument("item", nargs="?"); p.add_argument("state", nargs="?")
     p.add_argument("--unread", action="store_true"); p.add_argument("--tab", choices=["all", "dms", "mentions", "threads"], default="all")

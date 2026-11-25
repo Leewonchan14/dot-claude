@@ -32,6 +32,8 @@ posted only to Slack's process, so **Slack stays in the background and the mouse
 | `slackctl channels [--unread]` | read | Sidebar conversations: name, kind, id |
 | `slackctl read <conv> [-n 20]` | read | Recent messages with time, sender, text, ts, reply count, reactions |
 | `slackctl thread <conv> <ts>` | read | All messages of a thread, with reactions |
+| `slackctl read\|thread … --who` | read | Same, plus who reacted (Slack web client in ego-browser) |
+| `slackctl reactions <conv> <ts> [--thread <parent-ts>]` | read | Who reacted to one message, per emoji (ego-browser) |
 | `slackctl activity [--unread] [--tab all\|dms\|mentions\|threads] [-n 30]` | read | Notifications (Activity), with item ids |
 | `slackctl activity mark <item-id> read\|unread` | state | Mark one notification read/unread |
 | `slackctl scheduled` | read | Scheduled messages |
@@ -73,8 +75,14 @@ posted only to Slack's process, so **Slack stays in the background and the mouse
 - `forward --to` can only pick from Slack's suggestion list (recent conversations), because typed search text
   does not reach Slack's search. If the target is missing, the command lists what was offered.
 - `edit` / `forward` / `send --thread` / `react` need the target message to be rendered (recent).
-- Who reacted is not visible: Slack shows the names only in a hover tooltip, which AX cannot open.
-  Only the emoji, the count and whether you reacted are read.
+- Who reacted is not in the desktop app's AX tree: Slack shows the names only in a hover tooltip, which AX
+  cannot open (focus and mouse-moved events posted to Slack's pid do not trigger it). `--who` and `reactions`
+  therefore open the same conversation in the Slack web client (`app.slack.com/client/<team>/<channel>`) in a
+  short-lived ego-browser task space, hover each reaction pill with CDP input (the real mouse does not move),
+  read the tooltip ("A, B and You reacted with :emoji:", which also gives the exact shortcode) and close the
+  space. Needs ego-browser with Slack signed in; about 10 s per call. It reads no token or cookie.
+  Viewing a channel in the web client may mark it read. The team id is cached in `~/Library/Caches/slackctl/team`.
+  Do not open `<workspace>.slack.com/archives/…` links there: they redirect to a `slack://` deep link.
 - `react` adds a new emoji through the message's "Add reaction…" picker search. Slack's search does not match
   Hangul custom emoji names, so those can be picked only when they are in your frequently used emoji.
   An unknown name fails and lists what the picker shows.
@@ -90,6 +98,8 @@ slackctl read general -n 10                       # 최근 메시지 10개
 slackctl thread general 1700000000.123456         # 스레드 전체
 slackctl send general "Thanks!" --thread 1700000000.123456 --yes
 slackctl schedule @me 14:05 "reminder text" --yes
+slackctl reactions general 1700000000.123456      # 누가 어떤 이모지를 눌렀는지
+slackctl read general -n 10 --who                 # 최근 메시지 + 리액션 누른 사람
 slackctl react general 1700000000.123456 white_check_mark --yes          # 이모지 달기
 slackctl react general 1700000000.123456 eyes --remove --yes             # 내 이모지 빼기
 slackctl react general 1700000000.234567 +1 --thread 1700000000.123456 --yes   # 스레드 답글에
