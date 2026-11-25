@@ -6,6 +6,7 @@
 //   slack_ax dump                       JSON array of nodes {i, depth, role, text, cls, id, acts, val}
 //   slack_ax press|menu|show|focus|cancel <target>
 //   slack_ax set <target> <text>
+//   slack_ax attrs <target>             JSON of the element's AX attributes (for finding selectors)
 //   slack_ax type <text>                unicode key events to Slack's pid (goes to Slack's focused element)
 //   slack_ax key <keycode>              e.g. 36 = Return
 // target: "#<dom id>" | "i:<index from dump>" | "=<exact text>"
@@ -94,6 +95,15 @@ case "menu": ok = AXUIElementPerformAction(el, "AXShowMenu" as CFString) == .suc
 case "show": ok = AXUIElementPerformAction(el, "AXScrollToVisible" as CFString) == .success
 case "cancel": ok = AXUIElementPerformAction(el, kAXCancelAction as CFString) == .success
 case "focus": ok = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+case "attrs":
+    var names: CFArray?
+    AXUIElementCopyAttributeNames(el, &names)
+    var d: [String: String] = [:]
+    for n in (names as? [String]) ?? [] {
+        if n == kAXChildrenAttribute || n == "AXChildrenInNavigationOrder" { continue }
+        if let v = attr(el, n) { d[n] = String(describing: v).prefix(300).description }
+    }
+    FileHandle.standardOutput.write(try! JSONEncoder().encode(d)); exit(0)
 case "set": ok = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, (args.count > 2 ? args[2] : "") as CFString) == .success
 default: fail("unknown mode \(mode)", 3)
 }

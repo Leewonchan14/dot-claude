@@ -20,6 +20,8 @@ Examples
   slackctl scheduled
   slackctl send @me "hello" --yes
   slackctl schedule @me 14:05 "text" --yes
+  slackctl react general 1700000000.123456 white_check_mark --yes
+  slackctl react general 1700000000.123456 eyes --remove --yes
 """
 import argparse
 import hashlib
@@ -29,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -212,6 +215,30 @@ def parse_desc(desc):
     return sender, body.strip(), rest[cut.start():].lstrip(". ").strip()
 
 
+REACTION_LABEL = re.compile(r"^(\d+) reactions?, react with (.+?) emoji$")
+EMOJI_ALIASES = {"thumbsup": "+1", "thumbs_up": "+1", "thumbsdown": "-1", "thumbs_down": "-1"}
+
+
+def emoji_key(name):
+    """Compare emoji names loosely: Slack labels reactions 'white check mark' for :white_check_mark:."""
+    k = nfc((name or "").strip().strip(":")).lower()
+    k = EMOJI_ALIASES.get(k, k)
+    return re.sub(r"[\s_\-]+", " ", k).strip()
+
+
+def reactions_in(sub):
+    """Reaction pills of one message: emoji (Slack's label, spaces as _), count, and whether you reacted."""
+    out = []
+    for s in sub:
+        if s["role"] != "AXCheckBox" or "c-reaction" not in cls(s).split():
+            continue
+        m = REACTION_LABEL.match(s.get("text") or "")
+        if m:
+            out.append({"emoji": m.group(2).replace(" ", "_"), "count": int(m.group(1)),
+                        "me": bool(s.get("val")), "i": s["i"]})
+    return out
+
+
 def message_nodes(nodes, thread=False):
     out = []
     pat = re.compile(r"-thread-list-Thread_(\d+\.\d+)$") if thread else re.compile(r"^message-list_(\d+\.\d+)$")
@@ -223,9 +250,10 @@ def message_nodes(nodes, thread=False):
         sender_btn = next((s.get("text") for s in sub if "c-message__sender_button" in cls(s)), None)
         sender, body, meta = parse_desc(n["text"])
         replies = re.search(r"(\d+) repl", n["text"])
+        reactions = [{k: r[k] for k in ("emoji", "count", "me")} for r in reactions_in(sub)]
         out.append({"ts": m.group(1), "time": kst(m.group(1)), "sender": sender_btn or sender,
                     "text": body, "meta": meta, "replies": int(replies.group(1)) if replies else 0,
-                    "i": n["i"]})
+                    "reactions": reactions, "i": n["i"]})
     return out
 
 
@@ -608,6 +636,101 @@ def cmd_edit(a):
     return {"edited": bool(now and norm_text(a.text)[:40] in norm_text(now["text"])), "text": now and now["text"]}
 
 
+def nfc(s):
+    return unicodedata.normalize("NFC", s or "")
+
+
+def picker_box(nodes):
+    return next((n for n in nodes if n["role"] == "AXTextField" and "p-emoji_picker__input" in cls(n).split()), None)
+
+
+def close_picker():
+    """Escape from the picker's search box closes the picker (and only it); fall back to the overlay."""
+    for _ in range(2):
+        box = picker_box(dump())
+        if not box:
+            return
+        act("focus", f"i:{box['i']}")
+        ax("key", "53")
+        time.sleep(0.5)
+    if picker_box(dump()):
+        close_popovers()
+
+
+def pick_emoji(msg_i, emoji):
+    """Open 'Add reaction…' on a message, search the emoji picker and click the exact emoji."""
+    menu_pick(msg_i, r"^Add reaction")
+    nodes = wait_for(lambda ns: picker_box(ns) is not None, timeout=4)
+    if not nodes:
+        raise SlackError("emoji picker did not open")
+    box = picker_box(nodes)
+    act("focus", f"i:{box['i']}")
+    act("set", f"i:{box['i']}", "")
+    ax("type", emoji)
+    want = f"emoji-picker-{emoji}"
+    has = lambda ns: any(nfc(n.get("id")) == want for n in ns)
+    nodes = wait_for(has, timeout=4)
+    if not nodes:
+        # Slack's search does not match some names (e.g. Hangul custom emoji): clear the search and
+        # look in the unfiltered list, whose top rows are your frequently used emoji.
+        for _ in emoji:
+            ax("key", "51")
+        nodes = wait_for(has, timeout=3)
+    if not nodes:
+        shown = [n["id"][len("emoji-picker-"):] for n in dump()
+                 if (n.get("id") or "").startswith("emoji-picker-") and "p-emoji_picker__list_item" in cls(n)]
+        close_picker()
+        raise SlackError(f"no emoji named {emoji!r} in Slack's picker; it suggests {shown[:12]}")
+    # The result list re-renders while the search settles, so a dump index can point at another emoji
+    # by the time it is pressed: wait until two dumps in a row put it at the same index.
+    where = lambda ns: next((n["i"] for n in ns if nfc(n.get("id")) == want), None)
+    last = None
+    for _ in range(10):
+        time.sleep(0.4)
+        k = where(dump())
+        if k is not None and k == last:
+            break
+        last = k
+    try:
+        if k is None or k != last:
+            raise SlackError(f"emoji picker did not settle on {emoji!r}")
+        act("press", f"i:{k}")
+    except SlackError:
+        close_picker()
+        raise
+    time.sleep(0.8)
+
+
+def cmd_react(a):
+    emoji = nfc(a.emoji.strip().strip(":"))
+    target = {"conversation": a.conversation, "ts": a.ts, "thread": a.thread, "emoji": emoji,
+              "action": "remove" if a.remove else "add"}
+    if not a.yes:
+        return {"dryRun": True, "react": target}
+    nodes, m = find_message(a)
+    mine = lambda rs: next((r for r in rs if emoji_key(r["emoji"]) == emoji_key(emoji)), None)
+    hit = mine(reactions_in(subtree(nodes, m["i"])))
+    if a.remove:
+        if not hit or not hit["me"]:
+            return {"changed": False, "note": f"you have not reacted with :{emoji}: on this message",
+                    "reactions": m["reactions"]}
+        act("press", f"i:{hit['i']}")
+    elif hit and hit["me"]:
+        return {"changed": False, "note": f"you already reacted with :{emoji}:", "reactions": m["reactions"]}
+    elif hit:
+        act("press", f"i:{hit['i']}")  # someone else's pill: clicking it adds yours
+    else:
+        pick_emoji(m["i"], emoji)
+    time.sleep(1.0)
+    msgs = message_nodes(dump(), thread=bool(a.thread))
+    now = next((x for x in msgs if x["ts"] == a.ts), None)
+    if not now:
+        raise SlackError("message is no longer rendered; check it with 'slackctl read'")
+    after = mine(now["reactions"])
+    ok = (not after or not after["me"]) if a.remove else bool(after and after["me"])
+    return {"changed": ok, **target, "reactions": now["reactions"]}
+
+
 def cmd_forward(a):
     if not a.yes:
         return {"dryRun": True, "forward": {"conversation": a.conversation, "ts": a.ts, "to": a.to, "comment": a.comment}}
@@ -659,6 +782,10 @@ def cmd_forward(a):
 
 # ---------------- output ----------------
 
+def fmt_reactions(rs):
+    return ", ".join(f":{r['emoji']}: {r['count']}" + (" (you)" if r["me"] else "") for r in rs)
+
+
 def show(cmd, d):
     if isinstance(d, dict) and d.get("dryRun"):
         print("dry run (add --yes to do it):")
@@ -680,6 +807,11 @@ def show(cmd, d):
         for m in d["messages"]:
             extra = f"  [{m['replies']} replies]" if m.get("replies") else ""
             print(f"{m['time']}  {m['sender'] or '?'}: {m['text']}{extra}   ts={m['ts']}")
+            if m.get("reactions"):
+                print("    reactions: " + fmt_reactions(m["reactions"]))
+    elif cmd == "react" and "reactions" in d:
+        print(("done" if d.get("changed") else "not changed") + (f": {d['note']}" if d.get("note") else ""))
+        print("reactions: " + (fmt_reactions(d["reactions"]) or "none"))
     elif cmd == "activity" and "items" in d:
         print(f"{d['header']}" + ("  (unread only)" if d["unreadOnly"] else ""))
         for it in d["items"]:
@@ -719,6 +851,10 @@ def main():
     p.add_argument("conversation"); p.add_argument("time"); p.add_argument("text"); p.add_argument("--yes", action="store_true")
     p = add("edit", help="edit one of your messages")
     p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("text"); p.add_argument("--thread"); p.add_argument("--yes", action="store_true")
+    p = add("react", help="add (or --remove) your emoji reaction on a message")
+    p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("emoji", help="emoji name, e.g. white_check_mark or :eyes:")
+    p.add_argument("--thread", help="parent ts when the message is a thread reply")
+    p.add_argument("--remove", action="store_true"); p.add_argument("--yes", action="store_true")
     p = add("forward", help="forward a message to a person or channel")
     p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("--to", required=True); p.add_argument("--comment")
     p.add_argument("--thread"); p.add_argument("--yes", action="store_true")
