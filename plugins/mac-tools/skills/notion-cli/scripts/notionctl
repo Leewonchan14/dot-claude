@@ -6,15 +6,17 @@ without bringing Notion to the front or moving the mouse.
 Notion must run with a local debugging port: "notionctl launch --yes" restarts it that way
 (127.0.0.1:9333). "notionctl launch --normal --yes" restarts it without the port.
 
-Pages are addressed by an open tab: a Notion URL, a page id (32 hex, dashes optional) or a
-title substring. Commands other than "open" and "workspace" only work on tabs that are open and loaded.
+Pages are addressed by a Notion URL, a page id (32 hex, dashes optional) or the title of an open tab.
+Reads (blocks, read, image list|read, db list|rows, search) go through Notion's own web API from inside
+any loaded tab, so a page given by URL/id needs no tab of its own. Writes and UI commands need the page
+open in the tab Notion shows.
 
 "notionctl workspace" lists the accounts and workspaces of the switcher menu; "notionctl workspace
 <name> [--account <email>]" switches the tab shown in Notion to it (other tabs keep their page).
 
 "notionctl open" puts a page into a tab first: by URL/id (into the blank tab, or --in <tab>), or by
-following a sub-page link inside an open page. Notion only renders the blocks near the scroll position;
-"blocks" and "read" scroll through the whole page (--visible reads only what is rendered).
+following a sub-page link inside an open page. "--visible" reads only what the shown tab renders.
+NOTIONCTL_DOM=1 reads by scrolling the rendered page instead of the API; NOTIONCTL_DEBUG=1 logs timings.
 
 Write commands (move, edit, append, image add, file add, delete, db sort, launch) print a preview
 and do nothing unless --yes is given.
@@ -31,12 +33,14 @@ Examples
   notionctl edit ctl 3 "Block C" --yes
   notionctl append ctl "new line" --after "Block C" --yes
   notionctl image list ctl
-  notionctl image read ctl 1 -o /tmp/img.png
+  notionctl image read ctl 1 -o /tmp/img.png       # the original file; --capture for a screen capture
   notionctl image add ctl ./pic.png --after "Block C" --yes
   notionctl file add ctl ./doc.pdf --after "Block C" --yes
   notionctl delete ctl doc.pdf --yes
   notionctl db list ctl
-  notionctl db rows ctl
+  notionctl db rows ctl --view "By Status" --limit 50
+  notionctl search "release notes"                  # quick find in the workspace of a loaded tab
+  notionctl search "release notes" --local          # the app's local cache, all workspaces, no port needed
   notionctl db view ctl "By Status"
   notionctl db sort ctl "Due date" desc --yes
   notionctl db sort ctl --clear --yes
@@ -56,6 +60,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FENCE = '\x60\x60\x60';
 
 class CtlError extends Error {}
+const T0 = Date.now();
+const dbg = (...m) => { if (process.env.NOTIONCTL_DEBUG) console.error('[' + (Date.now() - T0) + 'ms]', ...m); };
 
 // ---------------- CDP ----------------
 
@@ -102,14 +108,38 @@ async function findTab(ref) {
 }
 
 class Page {
-  static async open(ref) {
+  // remote: a read may use any loaded tab when no tab shows the page (it then goes through the API only)
+  static async open(ref, { remote = false } = {}) {
     await requireCdp();
-    const tab = await findTab(ref);
+    let tab = null;
+    let isRemote = false;
+    try { tab = await findTab(ref); } catch (e) {
+      if (!remote || !pageIdOf(ref)) throw e;
+      tab = (await targets()).find((t) => !t.url.endsWith('/blank'));
+      if (!tab) throw e;
+      isRemote = true;
+    }
     const p = new Page(tab);
+    p.remote = isRemote;
+    p.pageId = dashed(isRemote ? pageIdOf(ref) : pageIdOf(tab.url) || '');
     await p.connect();
     return p;
   }
   constructor(tab) { this.tab = tab; this.id = 0; this.pending = new Map(); }
+  async api(ep, body) {
+    const r = await this.eval(JS_API, ep, body, this.user || null);
+    if (r.status !== 200 || !r.json) throw new CtlError('Notion API ' + ep + ' answered ' + r.status + (r.json && r.json.message ? ': ' + r.json.message : ''));
+    return r.json;
+  }
+  // DOM work needs the page open in the tab Notion shows: a background tab has no layout (0x0 window),
+  // and emulating one is not enough (Enter and the move shortcut do not reach it; tested 2026-11-25).
+  async dom() {
+    if (this.remote) throw new CtlError('this needs the page open in a Notion tab: notionctl open ' + this.pageId);
+    if (this.checked) return;
+    const s = await this.eval(String(function () { return { w: innerWidth, vis: document.visibilityState }; }));
+    if (!s.w || s.vis === 'hidden') throw new CtlError('tab "' + (this.tab.title || this.pageId) + '" is in the background; Notion lays out and takes input only in the tab it shows. Click that tab in Notion once (Notion can stay behind other apps), then run this again');
+    this.checked = true;
+  }
   async connect() {
     this.ws = new WebSocket(this.tab.webSocketDebuggerUrl);
     await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = () => rej(new CtlError('cannot connect to the Notion tab')); });
@@ -118,7 +148,7 @@ class Page {
       if (d.id && this.pending.has(d.id)) { this.pending.get(d.id)(d); this.pending.delete(d.id); }
     };
   }
-  close() { try { this.ws.close(); } catch {} }
+  async close() { try { this.ws.close(); } catch {} }
   send(method, params = {}) {
     return new Promise((res, rej) => {
       const i = ++this.id;
@@ -133,25 +163,216 @@ class Page {
     if (r.exceptionDetails) throw new CtlError('page script failed: ' + String((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text).split('\n')[0]);
     return r.result.value;
   }
-  async click(pt, count = 1) {
+  async click(pt, count = 1, settle = 500) {
     if (!pt) throw new CtlError('nothing to click');
     await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y });
     await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pt.x, y: pt.y, button: 'left', clickCount: count });
     await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: count });
-    await sleep(500);
+    if (settle) await sleep(settle);
   }
   async mouseAway() { await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 }); }
-  async key(name, modifiers = 0) {
+  async key(name, modifiers = 0, settle = 350) {
     const K = { Enter: [13, 'Enter'], Escape: [27, 'Escape'], ArrowUp: [38, 'ArrowUp'], ArrowDown: [40, 'ArrowDown'], ArrowRight: [39, 'ArrowRight'], End: [35, 'End'], Backspace: [8, 'Backspace'] }[name];
     const base = { key: name, code: K[1], windowsVirtualKeyCode: K[0], nativeVirtualKeyCode: K[0], modifiers };
     await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
     if (K[2] && !modifiers) await this.send('Input.dispatchKeyEvent', { type: 'char', text: K[2], ...base });
     await this.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
-    await sleep(350);
+    if (settle) await sleep(settle);
   }
-  async insertText(text) { await this.send('Input.insertText', { text }); await sleep(200); }
+  async insertText(text, settle = 200) { await this.send('Input.insertText', { text }); if (settle) await sleep(settle); }
 }
 const MOD = { alt: 1, ctrl: 2, cmd: 4, shift: 8 };
+
+// ---------------- Notion's web API, called from inside a loaded tab ----------------
+// The tab's own cookies authenticate the calls (same origin), so nothing leaves the app that the app
+// would not send itself. Reads through it need no scrolling and see every block (tables, closed
+// toggles, columns), which the rendered DOM does not.
+
+const JS_API = String(async function (ep, body, user) {
+  const h = { 'content-type': 'application/json' };
+  if (user) h['x-notion-active-user-header'] = user;
+  const r = await fetch('/api/v3/' + ep, { method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body) });
+  let json = null;
+  try { json = await r.json(); } catch {}
+  return { status: r.status, json };
+});
+
+// Signed-in accounts of the app (the tab's own account first).
+const JS_USERS = String(function () {
+  const ck = (n) => { const c = document.cookie.split(';').map((x) => x.trim()).find((x) => x.startsWith(n + '=')); return c ? decodeURIComponent(c.slice(n.length + 1)) : null; };
+  let all = [];
+  try { all = JSON.parse(ck('notion_users') || '[]'); } catch {}
+  return [...new Set([ck('notion_user_id'), ...all].filter(Boolean))];
+});
+
+// Download a Notion-hosted file with the tab's cookies; returns base64 and, for images, the pixel size.
+const JS_FETCH_FILE = String(async function (url) {
+  const r = await fetch(url, { credentials: 'include' });
+  if (!r.ok) return { error: 'download answered ' + r.status };
+  const blob = await r.blob();
+  let size = null;
+  try { const bm = await createImageBitmap(blob); size = [bm.width, bm.height]; bm.close(); } catch {}
+  const u = new Uint8Array(await blob.arrayBuffer());
+  let s = '';
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+  return { type: blob.type, size, b64: btoa(s) };
+});
+
+const dashed = (h) => String(h).replace(/-/g, '').toLowerCase().replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+// Record maps come as {value: {value, role}} (current) or {role, value} (older).
+const recVal = (x) => (x && x.value && typeof x.value === 'object' && 'role' in x.value && x.value.value ? x.value.value : (x && x.value) || null);
+const pageUrl = (id) => 'https://app.notion.com/p/' + String(id).replace(/-/g, '');
+
+// The first chunk of a page, as the signed-in account that can see it (sets p.user).
+async function firstChunk(p, pageId, limit = 100) {
+  for (const u of [...new Set([p.user || null, ...(await p.eval(JS_USERS))])]) {
+    p.user = u;
+    let j = null;
+    try { j = await p.api('loadPageChunk', { pageId, limit, cursor: { stack: [] }, chunkNumber: 0, verticalColumns: false }); } catch {}
+    if (j && j.recordMap && recVal((j.recordMap.block || {})[pageId])) return j;
+  }
+  throw new CtlError('Notion API: page ' + pageId + ' is not visible to any signed-in account');
+}
+
+// Every block of a page (not of its sub-pages), with the collections, views and users it mentions.
+async function loadRecords(p, pageId) {
+  const rec = { block: {}, collection: {}, collection_view: {}, notion_user: {}, space: {} };
+  const add = (rm) => { for (const t of Object.keys(rec)) for (const [k, v] of Object.entries((rm && rm[t]) || {})) { const val = recVal(v); if (val) rec[t][k] = val; } };
+  const chunk = (cursor, n) => p.api('loadPageChunk', { pageId, limit: 100, cursor, chunkNumber: n, verticalColumns: false });
+  let j = await firstChunk(p, pageId);
+  add(j.recordMap);
+  for (let n = 1; j.cursor && j.cursor.stack && j.cursor.stack.length && n < 100; n++) { j = await chunk(j.cursor, n); add(j.recordMap); }
+  const space = rec.block[pageId].space_id;
+  // blocks the chunks left out (deep nesting): fetch them by id
+  for (let round = 0; round < 10; round++) {
+    const missing = [];
+    const walk = (id, top) => {
+      const b = rec.block[id];
+      if (!b) { missing.push(id); return; }
+      if (!top && ['page', 'collection_view_page', 'collection_view'].includes(b.type)) return;
+      for (const c of b.content || []) walk(c, false);
+    };
+    walk(pageId, true);
+    if (!missing.length) break;
+    for (let i = 0; i < missing.length; i += 100) {
+      const ids = missing.slice(i, i + 100);
+      const r = await p.api('syncRecordValuesMain', { requests: ids.map((id) => ({ pointer: { table: 'block', id, spaceId: space }, version: -1 })) });
+      add(r.recordMap);
+      for (const id of ids) if (!rec.block[id]) rec.block[id] = { id, type: 'unavailable', alive: false };
+    }
+  }
+  await loadUsers(p, rec, usersIn(Object.values(rec.block).map((b) => b.properties)));
+  return rec;
+}
+
+// Records by id that a record map does not have yet (users, linked pages), in batches.
+async function syncRecords(p, rec, table, ids, spaceId) {
+  const need = [...new Set(ids)].filter((id) => id && !rec[table][id]).slice(0, 500);
+  for (let i = 0; i < need.length; i += 100) {
+    const r = await p.api('syncRecordValuesMain', { requests: need.slice(i, i + 100).map((id) => ({ pointer: spaceId ? { table, id, spaceId } : { table, id }, version: -1 })) });
+    for (const [k, v] of Object.entries((r.recordMap && r.recordMap[table]) || {})) { const val = recVal(v); if (val) rec[table][k] = val; }
+  }
+}
+const mentions = (props, kind) => { const ids = []; for (const v of Object.values(props || {})) if (Array.isArray(v)) for (const seg of v) for (const a of (seg && seg[1]) || []) if (a[0] === kind) ids.push(a[1]); return ids; };
+const usersIn = (propsList) => propsList.flatMap((x) => mentions(x, 'u'));
+async function loadUsers(p, rec, ids) { try { await syncRecords(p, rec, 'notion_user', ids); } catch {} }
+
+// Notion rich text ([[text, [[annotation, value], ...]], ...]) as plain text, or Markdown links with md.
+function richText(rt, rec, md) {
+  if (!Array.isArray(rt)) return '';
+  return rt.map((seg) => {
+    if (!Array.isArray(seg)) return '';
+    let s = String(seg[0]);
+    let link = null;
+    for (const a of seg[1] || []) {
+      if (a[0] === 'p') { const pg = rec && rec.block[a[1]]; s = pg ? richText(pg.properties && pg.properties.title, rec) || 'Untitled' : 'page'; if (md) link = pageUrl(a[1]); }
+      else if (a[0] === 'u') { const u = rec && rec.notion_user[a[1]]; s = '@' + (u ? u.name || u.email : 'user'); }
+      else if (a[0] === 'd') { const d = a[1] || {}; s = (d.start_date || '') + (d.start_time ? ' ' + d.start_time : '') + (d.end_date ? ' → ' + d.end_date + (d.end_time ? ' ' + d.end_time : '') : ''); }
+      else if (a[0] === 'e') s = '$' + a[1] + '$';
+      else if (a[0] === 'a') link = a[1];
+    }
+    if (md && s.trim()) {
+      const k = (seg[1] || []).map((a) => a[0]);
+      if (k.includes('c')) s = '`' + s + '`';
+      if (k.includes('b')) s = '**' + s + '**';
+      if (k.includes('i')) s = '*' + s + '*';
+      if (k.includes('s')) s = '~~' + s + '~~';
+    }
+    return md && link && s.trim() ? '[' + s + '](' + link + ')' : s;
+  }).join('');
+}
+
+const collOf = (b, rec) => rec.collection[b.collection_id || (b.format && b.format.collection_pointer && b.format.collection_pointer.id)] || null;
+
+// One block as the DOM reader reports it: {id, type, depth, text, ...}.
+function blockItem(b, rec, depth, parent) {
+  const pr = b.properties || {};
+  const f = b.format || {};
+  const it = { id: b.id, type: b.type, depth, text: richText(pr.title, rec) };
+  const md = richText(pr.title, rec, true);
+  if (md !== it.text) it.md = md;
+  if (b.type === 'to_do') it.checked = !!(pr.checked && pr.checked[0] && pr.checked[0][0] === 'Yes');
+  if (b.type === 'code') it.language = richText(pr.language, rec);
+  if (b.type === 'callout' && f.page_icon && f.page_icon.length <= 4) it.text = (f.page_icon + ' ' + it.text).trim();
+  if (b.type === 'image') {
+    it.src = richText(pr.source, rec) || f.display_source || null;
+    it.size = f.block_width && f.block_aspect_ratio ? [Math.round(f.block_width), Math.round(f.block_width * f.block_aspect_ratio)] : null;
+  }
+  if (['file', 'pdf', 'video', 'audio', 'bookmark', 'embed'].includes(b.type)) {
+    it.src = richText(pr.source, rec) || f.display_source || null;
+    it.text = [it.text || richText(pr.link, rec) || it.src, richText(pr.size, rec)].filter(Boolean).join('  ');
+  }
+  if (b.type === 'collection_view' || b.type === 'collection_view_page') {
+    const c = collOf(b, rec);
+    it.text = c ? richText(c.name, rec) : it.text;
+    it.views = (b.view_ids || []).map((v) => rec.collection_view[v]).filter(Boolean).map((v) => v.name || v.type);
+  }
+  if (b.type === 'alias') { const t = rec.block[f.alias_pointer && f.alias_pointer.id]; it.text = t ? richText(t.properties && t.properties.title, rec) : 'linked page'; }
+  if (b.type === 'table') {
+    const cols = (f.table_block_column_order || []).length;
+    const first = rec.block[(b.content || [])[0]];
+    it.text = cols + 'x' + (b.content || []).length + ' table' + (first ? ': ' + (f.table_block_column_order || []).map((k) => richText((first.properties || {})[k], rec)).join(' | ') : '');
+  }
+  if (b.type === 'table_row' && parent) {
+    const order = (parent.format && parent.format.table_block_column_order) || Object.keys(pr);
+    it.cells = order.map((k) => richText(pr[k], rec, true));
+    it.text = order.map((k) => richText(pr[k], rec)).join(' | ');
+    it.header = !!(parent.format && parent.format.table_block_column_header) && (parent.content || [])[0] === b.id;
+  }
+  return it;
+}
+
+function apiBlocks(rec, pageId, all) {
+  const out = [];
+  const visit = (id, depth, parent) => {
+    const b = rec.block[id];
+    if (!b || b.alive === false) return;
+    if (all || depth === 0) out.push(blockItem(b, rec, depth, parent));
+    if (!all || ['page', 'collection_view_page', 'collection_view', 'alias'].includes(b.type)) return;
+    for (const c of b.content || []) visit(c, depth + 1, b);
+  };
+  const pg = rec.block[pageId];
+  for (const c of pg.content || []) visit(c, 0, pg);
+  const title = pg.type.startsWith('collection_view') ? richText((collOf(pg, rec) || {}).name, rec) : richText(pg.properties && pg.properties.title, rec);
+  return { title: title || 'Untitled', blocks: out, source: 'api' };
+}
+
+async function apiPageBlocks(p, all = false) {
+  p.rec = await loadRecords(p, p.pageId);
+  return apiBlocks(p.rec, p.pageId, all);
+}
+
+// After a write the server copy follows the screen within a second or two; wait for it.
+async function apiBlocksUntil(p, all, pred, ms = 8000) {
+  const t0 = Date.now();
+  dbg('waiting for the server copy');
+  while (Date.now() - t0 < ms) {
+    try { const r = await apiPageBlocks(p, all); if (pred(r.blocks)) { dbg('server copy matches'); return r; } } catch (e) { dbg('API read failed: ' + e.message); break; }
+    await sleep(300);
+  }
+  dbg('server copy did not follow; scrolling the page');
+  return domPageBlocks(p, all);
+}
 
 // ---------------- page scripts (run inside Notion) ----------------
 
@@ -191,18 +412,20 @@ const JS_BLOCK_POINT = String(function (id, where) {
   const leaf = [...b.querySelectorAll('[data-content-editable-leaf="true"], [contenteditable="true"]')].find((e) => e.closest('[data-block-id]') === b);
   const el = leaf || b;
   const r = el.getBoundingClientRect();
+  // whether a click there lands inside this block (not on a sidebar link or another block)
+  const inside = (pt) => { const e = document.elementFromPoint(pt.x, pt.y); return { ...pt, hit: !!(e && e.closest('[data-block-id="' + id + '"]')) }; };
   if (where === 'head' && leaf) {
     const rng = document.createRange(); rng.selectNodeContents(leaf); const f = rng.getClientRects()[0];
-    if (f) return { x: f.left + 1, y: f.top + f.height / 2, editable: true };
-    return { x: r.left + 4, y: r.top + r.height / 2, editable: true };
+    if (f) return inside({ x: f.left + 1, y: f.top + f.height / 2, editable: true });
+    return inside({ x: r.left + 4, y: r.top + r.height / 2, editable: true });
   }
   if (where === 'end' && leaf) {
     const rng = document.createRange(); rng.selectNodeContents(leaf); const rs = rng.getClientRects();
     const last = rs[rs.length - 1];
-    if (last) return { x: Math.min(r.right - 3, last.right + 2), y: last.top + last.height / 2, editable: true };
-    return { x: r.left + 4, y: r.top + r.height / 2, editable: true };
+    if (last) return inside({ x: Math.min(r.right - 3, last.right + 2), y: last.top + last.height / 2, editable: true });
+    return inside({ x: r.left + 4, y: r.top + r.height / 2, editable: true });
   }
-  return { x: r.left + Math.min(20, r.width / 2), y: r.top + Math.min(15, r.height / 2), editable: !!leaf };
+  return inside({ x: r.left + Math.min(20, r.width / 2), y: r.top + Math.min(15, r.height / 2), editable: !!leaf });
 });
 
 const JS_CARET_BLOCK = String(function () {
@@ -299,14 +522,30 @@ const JS_OVERLAY = String(function (role, text, which) {
 // ---------------- helpers ----------------
 
 async function getBlocks(p, all = false) {
+  await p.dom();
   const r = await p.eval(JS_BLOCKS, all);
   if (r.error) throw new CtlError(r.error + ' - click the tab once in Notion so it renders');
   return r;
 }
 
-// Notion renders only the blocks near the scroll position. Scroll through the page and merge the windows.
+// The whole page: through Notion's API (fast, every block), else by scrolling the rendered page.
+// NOTIONCTL_DOM=1 forces the scrolling reader.
 async function pageBlocks(p, all = false) {
-  const s0 = await p.eval(JS_SCROLL, null);
+  if (!process.env.NOTIONCTL_DOM) {
+    try { return await apiPageBlocks(p, all); } catch (e) {
+      if (p.remote) throw e;
+      if (process.env.NOTIONCTL_DEBUG) console.error('API read failed (' + e.message + '); scrolling the page instead');
+    }
+  }
+  return domPageBlocks(p, all);
+}
+
+// Notion renders only the blocks near the scroll position. Scroll through the page and merge the windows.
+async function domPageBlocks(p, all = false) {
+  await p.dom();
+  let s0 = await p.eval(JS_SCROLL, null);
+  // a tab that was just shown can report its height before laying out the page
+  if (s0 && s0.h <= s0.vh + 10) { await sleep(400); s0 = await p.eval(JS_SCROLL, null); }
   const first = await getBlocks(p, all);
   if (!s0 || s0.h <= s0.vh + 10) return first;
   const order = [];
@@ -332,12 +571,31 @@ async function pageBlocks(p, all = false) {
   return { title, blocks: order };
 }
 
+// Where a block sits in the page (0..1), from the API copy; null when unknown.
+function blockFraction(p, id) {
+  if (!p.rec || !p.rec.block[p.pageId]) return null;
+  const order = apiBlocks(p.rec, p.pageId, true).blocks.map((b) => b.id);
+  const i = order.indexOf(id);
+  return i < 0 || order.length < 2 ? null : i / (order.length - 1);
+}
+
 // Scroll until the block is rendered, then center it.
 async function reveal(p, id) {
+  await p.dom();
   if (await p.eval(JS_REVEAL, id)) { await sleep(150); return; }
   const s0 = await p.eval(JS_SCROLL, null);
   if (!s0) throw new CtlError('page is not scrollable and block ' + id.slice(-8) + ' is not rendered');
   const step = Math.max(200, Math.floor(s0.vh * 0.6));
+  // jump near where the API copy puts the block, then look around it before scanning the page
+  const f = blockFraction(p, id);
+  if (f != null) {
+    const guess = Math.max(0, f * (s0.h - s0.vh));
+    for (const off of [0, -step, step, -2 * step, 2 * step]) {
+      await p.eval(JS_SCROLL, Math.max(0, guess + off));
+      await sleep(150);
+      if (await p.eval(JS_REVEAL, id)) { await sleep(150); return; }
+    }
+  }
   for (let y = 0; y < 500000; y += step) {
     const s = await p.eval(JS_SCROLL, y);
     await sleep(250);
@@ -370,10 +628,11 @@ async function caretInto(p, block, where = 'end') {
   await reveal(p, block.id);
   const pt = await p.eval(JS_BLOCK_POINT, block.id, where);
   if (!pt) throw new CtlError('block is not rendered');
-  await p.click(pt);
+  if (!pt.hit) throw new CtlError('the block is covered or off screen at the click point; nothing was clicked');
+  await p.click(pt, 1, pt.editable ? 0 : 300);
   if (pt.editable) {
-    const at = await p.eval(JS_CARET_BLOCK);
-    if (at !== block.id) throw new CtlError('could not place the caret in the block (caret is in ' + at + ')');
+    const at = await waitFor(async () => ((await p.eval(JS_CARET_BLOCK)) === block.id ? block.id : null), 1500, 50);
+    if (!at) throw new CtlError('could not place the caret in the block (caret is in ' + (await p.eval(JS_CARET_BLOCK)) + ')');
   }
   return pt;
 }
@@ -418,6 +677,10 @@ function parseArgs(argv) {
     else if (x === '--in') a.in = argv[++i];
     else if (x === '--account') a.account = argv[++i];
     else if (x === '--visible') a.visible = true;
+    else if (x === '--capture') a.capture = true;
+    else if (x === '--local') a.local = true;
+    else if (x === '--view') a.view = argv[++i];
+    else if (x === '--limit') a.limit = Number(argv[++i]);
     else if (x === '-h' || x === '--help') a.help = true;
     else a._.push(x);
   }
@@ -460,30 +723,41 @@ async function cmdStatus(a) {
 }
 
 async function cmdBlocks(a) {
-  const p = await Page.open(a._[1]);
+  const p = await Page.open(a._[1], { remote: !a.visible });
   try {
     const r = a.visible ? await getBlocks(p, a.all) : await pageBlocks(p, a.all);
     let n = 0;
     out(a, r, r.title + '\n' + r.blocks.map((b) => fmtBlock(b, b.depth === 0 ? ++n : null)).join('\n'));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function cmdRead(a) {
-  const p = await Page.open(a._[1]);
+  const p = await Page.open(a._[1], { remote: !a.visible });
   try {
     const r = a.visible ? await getBlocks(p, true) : await pageBlocks(p, true);
     const lines = ['# ' + r.title, ''];
+    let prev = null;
     for (const b of r.blocks) {
       const pad = '  '.repeat(b.depth);
-      if (b.type === 'image') lines.push(pad + '![image](' + (b.src || '') + ')');
+      const t = b.md || b.text;
+      if (prev === 'table_row' && b.type !== 'table_row') lines.push('');
+      prev = b.type;
+      if (b.type === 'table_row' && b.cells) {
+        const rp = '  '.repeat(Math.max(0, b.depth - 1));
+        lines.push(rp + '| ' + b.cells.map((c) => c.replace(/\|/g, '\\|').replace(/\n/g, '<br>')).join(' | ') + ' |');
+        if (b.header) lines.push(rp + '|' + b.cells.map(() => ' --- ').join('|') + '|');
+      }
+      else if (b.type === 'table' && r.source === 'api') lines.push('');
+      else if (b.type === 'image') lines.push(pad + '![image](' + (b.src || '') + ')');
       else if (b.views) lines.push(pad + '[database] ' + b.text + ' (views: ' + b.views.join(', ') + ')');
-      else if (b.type === 'to_do') lines.push(pad + (b.checked ? '- [x] ' : '- [ ] ') + b.text);
+      else if (b.type === 'to_do') lines.push(pad + (b.checked ? '- [x] ' : '- [ ] ') + t);
       else if (b.type === 'divider') lines.push(pad + '---');
-      else if (b.type === 'code') lines.push(pad + FENCE + '\n' + b.text + '\n' + FENCE);
-      else if (b.text) lines.push(pad + (MD[b.type] || '') + b.text);
+      else if (b.type === 'code') lines.push(pad + FENCE + (b.language || '').toLowerCase().replace(/\s+/g, '') + '\n' + b.text + '\n' + FENCE);
+      else if (b.type === 'page') lines.push(pad + '[page] ' + (b.text || 'Untitled') + (r.source === 'api' ? ' (' + pageUrl(b.id) + ')' : ''));
+      else if (t) lines.push(pad + (MD[b.type] || '') + t);
     }
     out(a, r, lines.join('\n'));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function cmdMove(a) {
@@ -498,28 +772,32 @@ async function cmdMove(a) {
     await reveal(p, b.id);
     if (needYes(a, 'move ' + b.type + ' "' + b.text.slice(0, 40) + '" ' + dir + ' ' + n + ' step(s) on "' + before.title + '"')) return;
     const editable = async (blk) => !!(await p.eval(JS_BLOCK_POINT, blk.id, 'start') || {}).editable;
+    let steps = 0;
     for (let i = 0; i < n; i++) {
       const cur = (await getBlocks(p)).blocks;
       const idx = cur.findIndex((x) => x.id === b.id);
       const nb = cur[dir === 'up' ? idx - 1 : idx + 1];
       if (!nb) break;
+      const order0 = cur.map((x) => x.id).join();
       if (await editable(b)) {
         await caretInto(p, b);
-        await p.key(dir === 'up' ? 'ArrowUp' : 'ArrowDown', MOD.cmd | MOD.shift);
+        await p.key(dir === 'up' ? 'ArrowUp' : 'ArrowDown', MOD.cmd | MOD.shift, 0);
       } else if (await editable(nb)) {
         // Notion ignores the move shortcut on a selected image/database; move the text neighbour the other way
         await caretInto(p, nb);
-        await p.key(dir === 'up' ? 'ArrowDown' : 'ArrowUp', MOD.cmd | MOD.shift);
+        await p.key(dir === 'up' ? 'ArrowDown' : 'ArrowUp', MOD.cmd | MOD.shift, 0);
       } else throw new CtlError('cannot move: neither this block nor its neighbour (' + nb.type + ') has editable text');
-      await sleep(300);
+      // the rendered order changes as soon as Notion has moved it
+      if (!(await waitFor(async () => (await getBlocks(p)).blocks.map((x) => x.id).join() !== order0, 2000, 60))) break;
+      steps++;
     }
-    await sleep(400);
     await p.mouseAway();
-    const after = await pageBlocks(p);
     const ib = before.blocks.findIndex((x) => x.id === b.id);
+    const want = ib + (dir === 'up' ? -steps : steps);
+    const after = steps ? await apiBlocksUntil(p, false, (bl) => bl.findIndex((x) => x.id === b.id) === want) : before;
     const ia = after.blocks.findIndex((x) => x.id === b.id);
     out(a, { moved: ia !== ib, from: ib + 1, to: ia + 1, blocks: after.blocks }, (ia !== ib ? 'moved #' + (ib + 1) + ' -> #' + (ia + 1) : 'position unchanged (#' + (ib + 1) + ')') + '\n' + listTop(after));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function cmdEdit(a) {
@@ -540,13 +818,14 @@ async function cmdEdit(a) {
       return s.toString() === leaf.innerText;
     }), b.id);
     if (!sel) throw new CtlError('could not select the block text');
-    await p.key('Backspace');
-    if (text) await p.insertText(text);
-    await sleep(500);
+    await p.key('Backspace', 0, 60);
+    if (text) await p.insertText(text, 0);
     await p.mouseAway();
-    const after = (await getBlocks(p)).blocks.find((x) => x.id === b.id);
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const r2 = await apiBlocksUntil(p, true, (bl) => { const x = bl.find((y) => y.id === b.id); return x && norm(x.text) === norm(text); }, 6000);
+    const after = r2.blocks.find((x) => x.id === b.id);
     out(a, after, 'now: ' + (after ? after.text : '(block gone)'));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function newBlockAfter(p, after) {
@@ -556,9 +835,9 @@ async function newBlockAfter(p, after) {
   await caretInto(p, after, 'end');
   const atEnd = await p.eval(String(function () { const s = getSelection(); const n = s.anchorNode; const e = n && (n.nodeType === 1 ? n : n.parentElement); const leaf = e && e.closest('[data-content-editable-leaf]'); if (!leaf) return false; const r = document.createRange(); r.selectNodeContents(leaf); r.setStart(s.anchorNode, s.anchorOffset); return r.toString().length === 0; }));
   if (!atEnd) throw new CtlError('caret is not at the end of the block; nothing changed');
-  await p.key('Enter');
-  const now = await p.eval(JS_CARET_BLOCK);
-  if (!now || now === after.id) throw new CtlError('could not create a new block');
+  await p.key('Enter', 0, 0);
+  const now = await waitFor(async () => { const c = await p.eval(JS_CARET_BLOCK); return c && c !== after.id ? c : null; }, 2000, 50);
+  if (!now) throw new CtlError('could not create a new block');
   return now;
 }
 
@@ -578,17 +857,18 @@ async function emptyBlockAfter(p, blocks, after) {
   await reveal(p, next.id);
   const np = await p.eval(JS_BLOCK_POINT, next.id, 'head');
   if (!np || !np.editable) throw new CtlError('the next block has no editable text');
+  if (!np.hit) throw new CtlError('the next block is covered or off screen at the click point; nothing was clicked');
   const seen = new Set((await getBlocks(p, true)).blocks.map((b) => b.id));
-  await p.click(np);
-  const c = await p.eval(JS_CARET_INFO);
+  await p.click(np, 1, 0);
+  const c = await waitFor(async () => { const x = await p.eval(JS_CARET_INFO); return x && x.id === next.id ? x : null; }, 1500, 50);
   if (!c || c.id !== next.id || !c.atStart) throw new CtlError('could not put the caret at the start of the next block; nothing changed');
-  await p.key('Enter');
+  await p.key('Enter', 0, 0);
   const nb = await waitFor(async () => {
     const v = (await getBlocks(p, true)).blocks;
     const k = v.findIndex((b) => b.id === next.id);
     const prev = k > 0 ? v[k - 1] : null;
     return prev && !seen.has(prev.id) ? prev : null;
-  }, 4000, 250);
+  }, 4000, 100);
   if (!nb) throw new CtlError('Enter did not create a new block above "' + next.text.slice(0, 30) + '"; check the page');
   await caretInto(p, nb, 'end');
   const c2 = await p.eval(JS_CARET_INFO);
@@ -629,33 +909,70 @@ async function cmdAppend(a) {
   if (text == null) throw new CtlError('usage: notionctl append <page> "<text>" [--after <block>] --yes');
   const p = await Page.open(page);
   try {
-    const r = await pageBlocks(p);
+    const r = await pageBlocks(p, true);
     const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
     if (!after) throw new CtlError('page has no blocks to add after');
     if (needYes(a, 'add a text block after ' + after.type + ' "' + after.text.slice(0, 40) + '" on "' + r.title + '":\n' + text)) return;
+    dbg('blocks loaded');
     await emptyBlockAfter(p, r.blocks, after);
+    dbg('empty block ready');
     const lines = String(text).split('\n');
-    for (let i = 0; i < lines.length; i++) { if (i) await p.key('Enter'); if (lines[i]) await p.insertText(lines[i]); }
-    await sleep(500);
+    for (let i = 0; i < lines.length; i++) { if (i) await p.key('Enter', 0, 120); if (lines[i]) await p.insertText(lines[i], 60); }
     await p.mouseAway();
-    const r2 = await pageBlocks(p);
+    const seen = new Set(r.blocks.map((x) => x.id));
+    const r2 = await apiBlocksUntil(p, true, (bl) => bl.filter((x) => !seen.has(x.id)).length >= lines.length && bl.some((x) => !seen.has(x.id) && x.text === lines[lines.length - 1]));
     out(a, r2, 'added.\n' + listTop(r2));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
+
+const IMG_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/heic': 'heic', 'image/avif': 'avif' };
+
+// The original file of an image block: Notion-hosted files through a signed URL and the tab's cookies,
+// other sites directly. null when it cannot be had (then the rendered image is captured instead).
+async function downloadImage(p, b) {
+  const src = b.src || '';
+  let url = src;
+  const blk = p.rec && p.rec.block[b.id];
+  if (/^attachment:/.test(src) || /amazonaws\.com|notion-static\.com|file\.notion\.(so|com)/.test(src)) {
+    const j = await p.api('getSignedFileUrls', { urls: [{ url: src, permissionRecord: { table: 'block', id: b.id, spaceId: blk && blk.space_id } }] });
+    url = (j.signedUrls || [])[0] || src;
+  }
+  if (!/^https?:/.test(url)) return null;
+  const r = await p.eval(JS_FETCH_FILE, url).catch(() => null);
+  if (r && !r.error) return { type: r.type, size: r.size, data: Buffer.from(r.b64, 'base64') };
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) return null;
+    return { type: (res.headers.get('content-type') || '').split(';')[0], size: null, data: Buffer.from(await res.arrayBuffer()) };
+  } catch { return null; }
+}
+
+const srcName = (src) => decodeURIComponent(String(src || '').split('?')[0].split(/[/:]/).pop() || '');
 
 async function cmdImage(a) {
   const sub = a._[1];
-  const p = await Page.open(a._[2]);
+  const p = await Page.open(a._[2], { remote: sub !== 'add' });
   try {
     const r = await pageBlocks(p, true);
     const imgs = r.blocks.filter((b) => b.type === 'image');
     if (sub === 'list') {
-      return out(a, imgs, imgs.length ? imgs.map((b, i) => (i + 1) + '. ' + b.id.slice(-8) + '  ' + (b.size || []).join('x')).join('\n') : 'no images');
+      return out(a, imgs, imgs.length ? imgs.map((b, i) => (i + 1) + '. ' + b.id.slice(-8) + '  ' + (b.size || []).join('x') + (r.source === 'api' ? '  ' + srcName(b.src) : '')).join('\n') : 'no images');
     }
     if (sub === 'read') {
       const ref = a._[3] || '1';
       const b = /^\d+$/.test(ref) ? imgs[Number(ref) - 1] : resolveBlock(imgs, ref);
       if (!b) throw new CtlError('no image ' + ref + ' (page has ' + imgs.length + ')');
+      if (r.source === 'api' && !a.capture) {
+        const got = await downloadImage(p, b);
+        if (got) {
+          fs.mkdirSync(CACHE, { recursive: true });
+          const file = a.out || path.join(CACHE, 'image-' + b.id.slice(-8) + '.' + (IMG_EXT[got.type] || 'png'));
+          fs.writeFileSync(file, got.data);
+          return out(a, { file, id: b.id, size: got.size, type: got.type, bytes: got.data.length, original: true }, file + '  (' + [got.size && got.size.join('x'), got.type, got.data.length + ' bytes'].filter(Boolean).join(', ') + ')');
+        }
+      }
+      if (p.remote) throw new CtlError('could not download the image; open the page in a tab to capture it instead');
+      if (r.source === 'api') { const d = (await getBlocks(p, true)).blocks.find((x) => x.id === b.id); if (d) b.size = d.size; }
       await p.mouseAway();
       await reveal(p, b.id);
       const rect = await p.eval(String(function (id) { const im = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"] img')].find((x) => x.naturalWidth) || document.querySelector('.notion-page-content [data-block-id="' + id + '"] img'); im.scrollIntoView({ block: 'center' }); const q = im.getBoundingClientRect(); return { x: q.left, y: q.top, w: q.width, h: q.height, nw: im.naturalWidth }; }), b.id);
@@ -679,14 +996,14 @@ async function cmdImage(a) {
       const nb = await emptyBlockAfter(p, r.blocks, after);
       await pasteFile(p, file, mime);
       // a grey placeholder shows first; large images can take a minute or more
-      const done = await waitFor(async () => { const x = (await getBlocks(p, true)).blocks.find((b) => b.type === 'image' && !r.blocks.some((o) => o.id === b.id)); return x && x.size && x.size[0] > 1 ? x : null; }, 120000, 1000);
+      const done = await waitFor(async () => { const x = (await getBlocks(p, true)).blocks.find((b) => b.type === 'image' && !r.blocks.some((o) => o.id === b.id)); return x && x.size && x.size[0] > 1 ? x : null; }, 120000, 500);
       if (!done) throw new CtlError('image block was added but did not finish uploading within 120s; check the page later');
       await p.mouseAway();
-      const r2 = await pageBlocks(p);
+      const r2 = await apiBlocksUntil(p, false, (bl) => bl.some((x) => x.id === done.id));
       return out(a, r2, 'uploaded.\n' + listTop(r2));
     }
     throw new CtlError('usage: notionctl image list|read|add <page> ...');
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function overlayClick(p, role, text, which) {
@@ -697,25 +1014,122 @@ async function overlayClick(p, role, text, which) {
 }
 
 function rowsText(r) {
-  if (r.layout === 'table') return r.header.join(' | ') + '\n' + r.rows.map((x) => x.cells.join(' | ')).join('\n');
-  if (r.layout === 'board') return r.groups.map((g, i) => '[column ' + (i + 1) + ']\n' + g.cards.map((c) => '  ' + c.text).join('\n')).join('\n');
-  return r.items.map((c) => c.text).join('\n');
+  const more = r.hasMore ? '\n(first ' + r.shown + ' rows; --limit N for more)' : '';
+  if (r.layout === 'table') return r.header.join(' | ') + '\n' + r.rows.map((x) => x.cells.join(' | ')).join('\n') + more;
+  if (r.layout === 'board') return r.groups.map((g, i) => '[' + (g.name != null ? g.name || '(none)' : 'column ' + (i + 1)) + ']\n' + g.cards.map((c) => '  ' + c.text).join('\n')).join('\n') + more;
+  return r.items.map((c) => c.text).join('\n') + more;
+}
+
+// ---- databases through the API: every row of a view with its properties ----
+
+// Databases on the page: inline ones at any depth, or the page itself when it is a database.
+function apiDbs(rec, pageId) {
+  const pg = rec.block[pageId];
+  const ids = pg.type.startsWith('collection_view') ? [pageId] : apiBlocks(rec, pageId, true).blocks.filter((b) => b.type === 'collection_view').map((b) => b.id);
+  return ids.map((id, i) => {
+    const b = rec.block[id];
+    const views = (b.view_ids || []).map((v) => rec.collection_view[v]).filter(Boolean);
+    return { n: i + 1, id, title: richText((collOf(b, rec) || {}).name, rec), views: views.map((v) => ({ name: v.name || v.type, active: false, id: v.id })), layout: views[0] ? views[0].type : 'other', rows: null };
+  });
+}
+
+const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString('sv-SE').slice(0, 16) : '');
+
+function propText(row, key, sch, rec) {
+  const v = (row.properties || {})[key];
+  const user = (id) => { const u = rec.notion_user[id]; return u ? u.name || u.email : ''; };
+  switch (sch && sch.type) {
+    case 'checkbox': return v && v[0] && v[0][0] === 'Yes' ? 'Yes' : 'No';
+    case 'created_time': return fmtTime(row.created_time);
+    case 'last_edited_time': return fmtTime(row.last_edited_time);
+    case 'created_by': return user(row.created_by_id);
+    case 'last_edited_by': return user(row.last_edited_by_id);
+    default: return richText(v, rec).replace(/\n+/g, ' ');   // formula and rollup values are computed by the app, not stored: empty
+  }
+}
+
+async function apiRows(p, blockId, viewName, limit) {
+  const rec = p.rec;
+  const b = rec.block[blockId];
+  const coll = collOf(b, rec);
+  if (!coll) throw new CtlError('the database\'s collection is not loaded');
+  const views = (b.view_ids || []).map((v) => rec.collection_view[v]).filter(Boolean);
+  const view = (viewName && (views.find((v) => v.name === viewName) || views.find((v) => (v.name || '').toLowerCase() === String(viewName).toLowerCase()))) || (viewName ? null : views[0]);
+  if (!view) throw new CtlError('view "' + viewName + '" not found; views: ' + views.map((v) => v.name).join(', '));
+  const q = view.query2 || {};
+  const j = await p.api('queryCollection', {
+    source: { type: 'collection', id: coll.id, spaceId: coll.space_id || b.space_id },
+    collectionView: { id: view.id, spaceId: view.space_id || b.space_id },
+    loader: { type: 'reducer', reducers: { collection_group_results: { type: 'results', limit } }, sort: q.sort || [], filter: q.filter || { filters: [], operator: 'and' }, searchQuery: '', userTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+  });
+  const res = ((j.result || {}).reducerResults || {}).collection_group_results || {};
+  const ids = res.blockIds || [];
+  for (const [k, v] of Object.entries((j.recordMap && j.recordMap.block) || {})) { const val = recVal(v); if (val) rec.block[k] = val; }
+  const rows = ids.map((id) => rec.block[id]).filter(Boolean);
+  // names for people and titles for relations
+  await loadUsers(p, rec, [...usersIn(rows.map((r) => r.properties)), ...rows.flatMap((r) => [r.created_by_id, r.last_edited_by_id])]);
+  try { await syncRecords(p, rec, 'block', rows.flatMap((r) => mentions(r.properties, 'p')), b.space_id); } catch {}
+  const schema = coll.schema || {};
+  const f = view.format || {};
+  let keys = (f[view.type + '_properties'] || f.table_properties || []).filter((x) => x.visible !== false && schema[x.property]).map((x) => x.property);
+  if (!keys.length) keys = Object.keys(schema);
+  keys = ['title', ...keys.filter((k) => k !== 'title')];
+  const header = keys.map((k) => schema[k].name);
+  const cells = (r) => keys.map((k) => propText(r, k, schema[k], rec));
+  const base = { view: view.name, viewType: view.type, shown: rows.length, hasMore: rows.length >= limit, source: 'api' };
+  const groupBy = view.type === 'board' && ((f.board_columns_by && f.board_columns_by.property) || (f.collection_group_by && f.collection_group_by.property));
+  if (groupBy && schema[groupBy]) {
+    const groups = new Map();
+    // column order of the board: values are plain strings or {option} / {value}
+    for (const col of f.board_columns || []) {
+      if (col.hidden) continue;
+      const vv = col.value && col.value.value;
+      groups.set(vv && typeof vv === 'object' ? vv.option || vv.value || '' : vv || '', []);
+    }
+    for (const r of rows) {
+      const g = propText(r, groupBy, schema[groupBy], rec);
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push({ id: r.id, text: cells(r).filter(Boolean).join(' | ') });
+    }
+    return { ...base, layout: 'board', groupBy: schema[groupBy].name, groups: [...groups].filter(([, c]) => c.length).map(([name, cards]) => ({ name, cards })) };
+  }
+  return { ...base, layout: 'table', header, rows: rows.map((r) => { const c = cells(r); return { id: r.id, cells: c, props: Object.fromEntries(keys.map((k, i) => [schema[k].name, c[i]])) }; }) };
 }
 
 async function cmdDb(a) {
   const sub = a._[1];
   const n = a.db || 1;
-  const p = await Page.open(a._[2]);
+  const readOnly = ['list', 'rows'].includes(sub);
+  const p = await Page.open(a._[2], { remote: readOnly });
   try {
-    for (let i = 0; i < 3 && (await p.eval(JS_OVERLAY, 'dialog', null)).items.length; i++) await p.key('Escape');
-    const dbs = await p.eval(JS_DBS);
+    let dbs = [];
+    if (!p.remote) {
+      try {
+        await p.dom();
+        for (let i = 0; i < 3 && (await p.eval(JS_OVERLAY, 'dialog', null)).items.length; i++) await p.key('Escape');
+        dbs = await p.eval(JS_DBS);
+      } catch (e) { if (!readOnly || !(e instanceof CtlError)) throw e; }   // a background tab: read through the API
+    }
+    if (readOnly && (p.remote || !dbs.length) && !process.env.NOTIONCTL_DOM) { await apiPageBlocks(p); dbs = apiDbs(p.rec, p.pageId); }
     if (sub === 'list') {
-      return out(a, dbs, dbs.length ? dbs.map((d) => d.n + '. ' + d.title + '  [' + d.layout + ', ' + d.rows + ' rows]  views: ' + d.views.map((v) => (v.active ? '*' : '') + v.name).join(', ') + (d.moreViews ? ' (+' + d.moreViews + ' more)' : '')).join('\n') : 'no databases on this page');
+      return out(a, dbs, dbs.length ? dbs.map((d) => d.n + '. ' + d.title + '  [' + d.layout + (d.rows != null ? ', ' + d.rows + ' rows' : '') + ']  views: ' + d.views.map((v) => (v.active ? '*' : '') + v.name).join(', ') + (d.moreViews ? ' (+' + d.moreViews + ' more)' : '')).join('\n') : 'no databases on this page');
     }
     const db = dbs[n - 1];
     if (!db) throw new CtlError('no database #' + n + ' (page has ' + dbs.length + ')');
     const active = (db.views.find((v) => v.active) || {}).name;
     if (sub === 'rows') {
+      // every row of the view with its properties through the API; the rendered rows otherwise
+      if (!process.env.NOTIONCTL_DOM) {
+        try {
+          if (!p.rec) await apiPageBlocks(p);
+          const r = await apiRows(p, db.id, a.view || active, a.limit || 100);
+          return out(a, r, db.title + ' - ' + r.view + (r.groupBy ? ' (by ' + r.groupBy + ')' : '') + ' - ' + r.shown + ' rows\n' + rowsText(r));
+        } catch (e) {
+          if (p.remote || a.view) throw e;
+          if (process.env.NOTIONCTL_DEBUG) console.error('API rows failed (' + e.message + '); reading the rendered rows');
+        }
+      }
+      if (a.view) throw new CtlError('--view needs the API; switch the shown view with: notionctl db view');
       const r = await p.eval(JS_DB_ROWS, n);
       return out(a, r, db.title + ' - ' + active + '\n' + rowsText(r));
     }
@@ -793,7 +1207,7 @@ async function cmdDb(a) {
       return out(a, r, (q ? 'search "' + q + '": ' : 'search cleared: ') + count + ' rows\n' + rowsText(r));
     }
     throw new CtlError('usage: notionctl db list|rows|view|sort|search <page> ...');
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function cmdFile(a) {
@@ -820,12 +1234,12 @@ async function cmdFile(a) {
         if (t.includes(name) && /\d\s?(B|KiB|MiB|GiB|KB|MB|GB)\b/.test(t) && !/Uploading|Loading/i.test(t)) return { id: b.dataset.blockId, text: t.replace(/\s+/g, ' ').trim() };
       }
       return null;
-    }), [...seen], name), 60000, 700);
+    }), [...seen], name), 60000, 400);
     if (!done) throw new CtlError('file block did not finish uploading within 60s; check the page');
     await p.mouseAway();
-    const r2 = await pageBlocks(p);
+    const r2 = await apiBlocksUntil(p, false, (bl) => bl.some((x) => x.id === done.id));
     out(a, { uploaded: done, blocks: r2.blocks }, 'uploaded ' + done.text + '\n' + listTop(r2));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 async function waitLoaded(p, id) {
@@ -862,7 +1276,7 @@ async function cmdOpen(a) {
       const ok = await waitLoaded(p, pageIdOf(pt.href));
       if (!ok) throw new CtlError('the tab did not move to ' + pt.href);
       return out(a, ok, 'opened ' + ok.title + '  ' + ok.url);
-    } finally { p.close(); }
+    } finally { await p.close(); }
   }
   const id = pageIdOf(target);
   if (!id) throw new CtlError('usage: notionctl open <url|page id> [--in <tab>]   or   notionctl open <tab> <block with a page link>');
@@ -878,7 +1292,7 @@ async function cmdOpen(a) {
     const ok = await waitLoaded(p, id);
     if (!ok) throw new CtlError('page did not load in 20s (no access in this Notion account, or a wrong id?)');
     out(a, ok, 'opened ' + ok.title + '  ' + ok.url + (a.in ? '' : '  (in the blank tab)'));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 // Hover the block, click its drag handle ("Drag to move, click to open menu") and return the menu items.
@@ -889,7 +1303,7 @@ async function openBlockMenu(p, b) {
     const q = el.getBoundingClientRect(); return { x: q.left + 30, y: q.top + Math.min(12, q.height / 2) };
   }), b.id);
   await p.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y });
-  await sleep(600);
+  await sleep(150);
   // the visible handle closest to the hovered row (hidden handles of other blocks can stay in the DOM)
   const h = await waitFor(() => p.eval(String(function (y) {
     const hs = [...document.querySelectorAll('[role=button]')].filter((x) => (x.getAttribute('aria-label') || '').startsWith('Drag to move')).map((e) => {
@@ -897,14 +1311,14 @@ async function openBlockMenu(p, b) {
       return { ...c, ok: q.width > 0 && getComputedStyle(e).opacity !== '0', d: Math.abs(c.y - y) };
     }).filter((c) => c.ok && c.d < 40).sort((m, n) => m.d - n.d);
     return hs[0] || null;
-  }), at.y), 2000, 200);
+  }), at.y), 2500, 100);
   if (!h) throw new CtlError('block handle did not appear on hover');
   for (let k = 1; k <= 6; k++) { await p.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x + (h.x - at.x) * k / 6, y: at.y + (h.y - at.y) * k / 6 }); await sleep(60); }
   await sleep(200);
   await p.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: h.x, y: h.y, button: 'left', buttons: 1, clickCount: 1 });
   await sleep(80);
   await p.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: h.x, y: h.y, button: 'left', buttons: 0, clickCount: 1 });
-  const open = await waitFor(() => p.eval(String(function () { return document.querySelectorAll('.notion-overlay-container [role=menuitem], .notion-overlay-container [role=option]').length > 3; })), 3000, 200);
+  const open = await waitFor(() => p.eval(String(function () { return document.querySelectorAll('.notion-overlay-container [role=menuitem], .notion-overlay-container [role=option]').length > 3; })), 3000, 100);
   if (!open) throw new CtlError('the block menu did not open');
 }
 
@@ -927,18 +1341,18 @@ async function cmdDelete(a) {
     let gone = false;
     for (let attempt = 0; attempt < 2 && !gone; attempt++) {   // the first click sometimes lands while the menu is still animating
       await openBlockMenu(p, b);
-      await sleep(300);
+      await sleep(150);
       const it = await p.eval(JS_MENU_ITEM, 'Delete');
       if (!it || it.items) { await p.key('Escape'); throw new CtlError('no "Delete" in the block menu; menu shows: ' + ((it && it.items) || []).join(', ')); }
-      await p.click(it);
-      gone = await waitFor(async () => !(await getBlocks(p, true)).blocks.some((x) => x.id === b.id), 4000, 300);
+      await p.click(it, 1, 0);
+      gone = await waitFor(async () => !(await getBlocks(p, true)).blocks.some((x) => x.id === b.id), 4000, 100);
       if (!gone) { await p.key('Escape'); await sleep(400); }
     }
     if (!gone) throw new CtlError('block is still there after Delete; check the page');
     await p.mouseAway();
-    const r2 = await pageBlocks(p);
+    const r2 = await apiBlocksUntil(p, false, (bl) => !bl.some((x) => x.id === b.id));
     out(a, { deleted: b.id, blocks: r2.blocks }, 'deleted ' + b.id.slice(-8) + '\n' + listTop(r2));
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 // ---- workspaces: the switcher menu at the top/bottom of the sidebar ----
@@ -982,7 +1396,7 @@ const JS_WORKSPACES = String(function () {
 async function visibleTab() {
   for (const t of await targets()) {
     const p = new Page(t);
-    try { await p.connect(); if ((await p.eval(String(function () { return document.visibilityState; }))) === 'visible') return t; } catch {} finally { p.close(); }
+    try { await p.connect(); if ((await p.eval(String(function () { return document.visibilityState; }))) === 'visible') return t; } catch {} finally { await p.close(); }
   }
   return null;
 }
@@ -1040,19 +1454,97 @@ async function cmdWorkspace(a) {
     done.title = await p.eval(String(function () { return document.title; }));
     done.url = (await p.eval(String(function () { return location.href; }))).split('?')[0];
     out(a, { workspace: w.name, account: w.email, ...done }, 'switched tab to ' + w.name + (w.guest ? ' (guest)' : '') + ' [' + w.email + ']\n' + done.title + '  ' + done.url);
-  } finally { p.close(); }
+  } finally { await p.close(); }
+}
+
+// ---- search: Notion's quick-find through the API, or the app's local cache (--local) ----
+
+const SEARCH_FILTERS = { isDeletedOnly: false, excludeTemplates: false, navigableBlockContentOnly: true, requireEditPermissions: false, includePublicPagesWithoutExplicitAccess: false, ancestors: [], createdBy: [], editedBy: [], lastEditedTime: {}, createdTime: {}, inTeams: [] };
+const stripTags = (s) => String(s || '').replace(/<\/?[^>]+>/g, '');
+
+async function cmdSearch(a) {
+  const q = a._[1];
+  if (!q) throw new CtlError('usage: notionctl search "<text>" [--limit N] [--in <tab>] [--local]');
+  const limit = a.limit || 20;
+  if (a.local) return localSearch(a, q, limit);
+  await requireCdp();
+  const tab = a.in ? await findTab(a.in) : (await targets()).find((t) => !t.url.endsWith('/blank'));
+  if (!tab) throw new CtlError('no loaded Notion tab to search from; open a page, or use --local');
+  const p = new Page(tab);
+  p.pageId = dashed(pageIdOf(tab.url) || '');
+  await p.connect();
+  try {
+    // the workspace (and account) of that tab's page
+    const j0 = await firstChunk(p, p.pageId, 1);
+    const pg = recVal(j0.recordMap.block[p.pageId]);
+    const spaceId = pg.space_id;
+    const j = await p.api('search', { type: 'BlocksInSpace', query: q, spaceId, limit, filters: SEARCH_FILTERS, sort: { field: 'relevance' }, source: 'quick_find', searchSessionId: require('crypto').randomUUID(), searchSessionFlowNumber: 1 });
+    const rec = { block: {}, collection: {}, collection_view: {}, notion_user: {}, space: {} };
+    for (const t of Object.keys(rec)) for (const [k, v] of Object.entries((j.recordMap && j.recordMap[t]) || {})) { const val = recVal(v); if (val) rec[t][k] = val; }
+    const space = rec.space[spaceId];
+    const items = (j.results || []).map((x) => {
+      const b = rec.block[x.id] || {};
+      const title = b.type && b.type.startsWith('collection_view') ? richText((collOf(b, rec) || {}).name, rec) : richText(b.properties && b.properties.title, rec);
+      const hl = x.highlight || {};
+      return { id: x.id, type: b.type, title: stripTags(hl.title) || title || 'Untitled', snippet: stripTags(hl.text), path: stripTags(hl.pathText), url: pageUrl(x.id) };
+    });
+    const head = 'search "' + q + '" in ' + (space ? space.name : spaceId) + ': ' + items.length + (j.total > items.length ? ' of ' + j.total : '') + ' results';
+    out(a, { query: q, spaceId, space: space && space.name, total: j.total, results: items }, head + '\n' + items.map((x, i) => String(i + 1).padStart(2) + '. ' + x.title + '  ' + x.url + (x.snippet ? '\n    ' + x.snippet.replace(/\s+/g, ' ').slice(0, 160) : '')).join('\n'));
+  } finally { await p.close(); }
+}
+
+// The app keeps the pages it has shown in a SQLite file; search it read-only (no Notion port needed).
+// It only knows pages this Mac has opened, and may lag the server.
+function localSearch(a, q, limit) {
+  const file = path.join(os.homedir(), 'Library/Application Support/Notion/notion.db');
+  if (!fs.existsSync(file)) throw new CtlError('no local Notion cache at ' + file);
+  const emit = process.emitWarning;
+  process.emitWarning = () => {};   // node:sqlite announces itself as experimental
+  let db;
+  try { db = new (require('node:sqlite').DatabaseSync)(file, { readOnly: true }); } finally { process.emitWarning = emit; }
+  try {
+    const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+    const hits = db.prepare("SELECT id, type, parent_id, parent_table, space_id, properties, last_edited_time FROM block WHERE alive = 1 AND properties LIKE ? ESCAPE '\\' ORDER BY last_edited_time DESC LIMIT 1000").all(like);
+    const ql = q.toLowerCase();
+    const plain = (props) => { try { return Object.values(JSON.parse(props || '{}')).map((v) => richText(v, null)).join(' '); } catch { return ''; } };
+    const titleOf = (b) => { try { return richText(JSON.parse(b.properties || '{}').title, null); } catch { return ''; } };
+    const byId = new Map();
+    const get = db.prepare('SELECT id, type, parent_id, parent_table, space_id, properties FROM block WHERE id = ?');
+    const row = (id) => { if (!byId.has(id)) byId.set(id, get.get(id) || null); return byId.get(id); };
+    const isPage = (b) => b && (b.type === 'page' || b.type === 'collection_view_page');
+    const pages = new Map();
+    for (const h of hits) {
+      const text = plain(h.properties);
+      if (!text.toLowerCase().includes(ql)) continue;   // the LIKE also matches ids inside the JSON
+      let b = h;
+      for (let k = 0; k < 40 && b && !isPage(b) && b.parent_table === 'block'; k++) b = row(b.parent_id);
+      if (!isPage(b)) continue;
+      const pg = pages.get(b.id) || { id: b.id, space_id: b.space_id, title: titleOf(b), hits: 0, titleHit: false, snippet: '', edited: 0 };
+      pg.hits++;
+      pg.edited = Math.max(pg.edited, h.last_edited_time || 0);
+      if (b.id === h.id && pg.title.toLowerCase().includes(ql)) pg.titleHit = true;
+      else if (!pg.snippet) { const i = text.toLowerCase().indexOf(ql); pg.snippet = (i > 40 ? '…' : '') + text.slice(Math.max(0, i - 40), i + q.length + 100); }
+      pages.set(b.id, pg);
+    }
+    const spaces = Object.fromEntries(db.prepare('SELECT id, name FROM space').all().map((s) => [s.id, s.name]));
+    const items = [...pages.values()].sort((x, y) => (y.titleHit - x.titleHit) || (y.hits - x.hits) || (y.edited - x.edited)).slice(0, limit)
+      .map((x) => ({ id: x.id, title: x.title || 'Untitled', space: spaces[x.space_id] || x.space_id, hits: x.hits, snippet: x.snippet, edited: fmtTime(x.edited), url: pageUrl(x.id) }));
+    out(a, { query: q, local: true, results: items }, 'local search "' + q + '": ' + items.length + ' pages (cached on this Mac)\n' +
+      items.map((x, i) => String(i + 1).padStart(2) + '. ' + x.title.replace(/\s+/g, ' ').slice(0, 80) + '  [' + x.space + ', ' + x.edited + ']  ' + x.url + (x.snippet ? '\n    ' + x.snippet.replace(/\s+/g, ' ').slice(0, 160) : '')).join('\n'));
+  } finally { db.close(); }
 }
 
 async function cmdScreenshot(a) {
   const p = await Page.open(a._[1]);
   try {
+    await p.dom();
     await p.mouseAway();
     const shot = await p.send('Page.captureScreenshot', { format: 'png' });
     fs.mkdirSync(CACHE, { recursive: true });
     const file = a.out || path.join(CACHE, 'page.png');
     fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
     out(a, { file }, file);
-  } finally { p.close(); }
+  } finally { await p.close(); }
 }
 
 const HELP = fs.readFileSync(__filename, 'utf8').split('*/')[0].replace(/^#!.*\n\/\*\n?/, '');
@@ -1061,9 +1553,9 @@ async function main() {
   const a = parseArgs(process.argv.slice(2));
   const cmd = a._[0];
   if (!cmd || a.help) { console.log(HELP); return; }
-  const table = { launch: cmdLaunch, status: cmdStatus, open: cmdOpen, file: cmdFile, delete: cmdDelete, workspace: cmdWorkspace, blocks: cmdBlocks, read: cmdRead, move: cmdMove, edit: cmdEdit, append: cmdAppend, image: cmdImage, db: cmdDb, screenshot: cmdScreenshot };
+  const table = { launch: cmdLaunch, status: cmdStatus, open: cmdOpen, search: cmdSearch, file: cmdFile, delete: cmdDelete, workspace: cmdWorkspace, blocks: cmdBlocks, read: cmdRead, move: cmdMove, edit: cmdEdit, append: cmdAppend, image: cmdImage, db: cmdDb, screenshot: cmdScreenshot };
   if (!table[cmd]) throw new CtlError('unknown command: ' + cmd + '\n' + HELP);
-  if (!['launch', 'status', 'workspace'].includes(cmd) && !a._[['image', 'db', 'file'].includes(cmd) ? 2 : 1]) throw new CtlError('missing <page> (URL, page id or tab title)');
+  if (!['launch', 'status', 'workspace', 'search'].includes(cmd) && !a._[['image', 'db', 'file'].includes(cmd) ? 2 : 1]) throw new CtlError('missing <page> (URL, page id or tab title)');
   await table[cmd](a);
 }
 
