@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""slackctl - read and drive the Slack desktop app through macOS Accessibility, without taking focus.
+
+Reads what Slack renders (sidebar, messages, threads, Activity, scheduled messages) and clicks,
+types and opens menus inside Slack via AX actions and key events posted only to Slack's process.
+The app stays in the background: no window activation, no mouse movement.
+
+Write commands (send, schedule, edit, forward, scheduled delete/reschedule) print a preview and
+do nothing unless --yes is given.
+
+Examples
+  slackctl status
+  slackctl unread
+  slackctl channels
+  slackctl read general -n 10
+  slackctl thread general 1700000000.123456
+  slackctl activity                 # newest notifications
+  slackctl activity --unread
+  slackctl activity mark <item-id> read|unread
+  slackctl scheduled
+  slackctl send @me "hello" --yes
+  slackctl schedule @me 14:05 "text" --yes
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SRC = os.path.join(HERE, "slack_ax.swift")
+CACHE = os.path.expanduser("~/Library/Caches/slackctl")
+KST_FMT = "%m/%d %H:%M"
+
+
+class SlackError(Exception):
+    pass
+
+
+# ---------------- helper binary ----------------
+
+def helper_path():
+    with open(SRC, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+    path = os.path.join(CACHE, f"slack_ax-{digest}")
+    if not os.path.exists(path):
+        os.makedirs(CACHE, exist_ok=True)
+        r = subprocess.run(["swiftc", "-O", SRC, "-o", path], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SlackError("failed to compile slack_ax.swift:\n" + r.stderr[-2000:])
+    return path
+
+
+HELPER = None
+
+
+def ax(*args, parse=True):
+    global HELPER
+    HELPER = HELPER or helper_path()
+    r = subprocess.run([HELPER, *args], capture_output=True, text=True, timeout=60)
+    outp = r.stdout.strip()
+    if r.returncode != 0:
+        try:
+            raise SlackError(json.loads(outp)["error"])
+        except (ValueError, KeyError):
+            raise SlackError(outp or r.stderr.strip() or f"slack_ax exited {r.returncode}")
+    return json.loads(outp) if parse and outp else outp
+
+
+def dump():
+    return ax("dump")
+
+
+def act(mode, target, *rest):
+    res = ax(mode, target, *rest)
+    if not res.get("ok"):
+        raise SlackError(f"{mode} {target} failed")
+    return res
+
+
+def title():
+    t = ax("windows").get("titles") or [""]
+    return t[0]
+
+
+def view_name(t=None):
+    t = t if t is not None else title()
+    return re.sub(r" \((Channel|DM)\)$", "", re.sub(r"^! ", "", t.split(" - ")[0])) if t else ""
+
+
+def wait_for(pred, timeout=6.0, step=0.4):
+    end = time.time() + timeout
+    nodes = dump()
+    while not pred(nodes):
+        if time.time() > end:
+            return None
+        time.sleep(step)
+        nodes = dump()
+    return nodes
+
+
+def subtree(nodes, k):
+    base = nodes[k]["depth"]
+    out = []
+    for n in nodes[k + 1:]:
+        if n["depth"] <= base:
+            break
+        out.append(n)
+    return out
+
+
+def cls(n):
+    return n.get("cls") or ""
+
+
+def norm_text(s):
+    return " ".join((s or "").replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').split())
+
+
+def kst(ts):
+    return datetime.fromtimestamp(float(ts)).strftime(KST_FMT)
+
+
+# ---------------- navigation ----------------
+
+def go_home():
+    act("press", "#home")
+    if not wait_for(lambda ns: any(n.get("id") == "Pdrafts" for n in ns)):
+        raise SlackError("Home sidebar did not appear")
+
+
+ROW_ID = re.compile(r"^[CDG][A-Z0-9]{6,}$")
+
+
+def sidebar_rows(nodes):
+    rows = []
+    for n in nodes:
+        if n["role"] == "AXRow" and ROW_ID.match(n.get("id") or ""):
+            text = n.get("text") or ""
+            name = re.sub(r"\s*\(.*$", "", text).strip()
+            kind = {"C": "channel", "G": "channel", "D": "dm"}[n["id"][0]]
+            if "private" in text:
+                kind = "private"
+            if n["id"][0] == "C" and "," in name and "members" not in text:
+                kind = "group-dm"
+            rows.append({"i": n["i"], "id": n["id"], "name": name, "kind": kind, "label": text,
+                         "unread": bool(re.search(r"unread|new message", text, re.I)),
+                         "you": "(you" in text})
+    return rows
+
+
+def find_row(rows, query):
+    q = query.strip()
+    if q.lower() in ("@me", "me", "self"):
+        return next((r for r in rows if r["you"]), None)
+    q = q.lstrip("#@").lower()
+    for pred in (lambda r: r["id"].lower() == q, lambda r: r["name"].lower() == q,
+                 lambda r: r["name"].lower().startswith(q)):
+        hit = next((r for r in rows if pred(r)), None)
+        if hit:
+            return hit
+    return None
+
+
+def open_conv(query):
+    """Open a channel or DM by name, '#name', '@name', '@me' or ID. Returns its sidebar row."""
+    go_home()
+    nodes = dump()
+    row = find_row(sidebar_rows(nodes), query)
+    if not row:
+        # Not rendered in the virtual sidebar: filter the sidebar by name.
+        box = next((n for n in nodes if n["role"] == "AXTextField" and "c-filter_input__input" in cls(n)), None)
+        if not box:
+            raise SlackError(f"conversation not found in sidebar: {query}")
+        act("focus", f"i:{box['i']}")
+        act("set", f"i:{box['i']}", "")
+        ax("type", query.lstrip("#@"))
+        nodes = wait_for(lambda ns: find_row(sidebar_rows(ns), query) is not None, timeout=4) or dump()
+        row = find_row(sidebar_rows(nodes), query)
+        if not row:
+            raise SlackError(f"conversation not found: {query}")
+    act("press", f"i:{row['i'] + 1}")  # the row itself ignores AXPress; its first child opens it
+    want = row["name"].split(",")[0]
+    wait_for(lambda ns: want.lower() in view_name().lower() or any("ql-editor" in cls(n) for n in ns), timeout=5)
+    time.sleep(0.6)
+    return row
+
+
+# ---------------- messages ----------------
+
+WHEN = re.compile(
+    r"\.? (?:(?:Today|Yesterday|(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day|[A-Z][a-z]{2,8} \d{1,2}(?:st|nd|rd|th)?) at )?"
+    r"(?:\d{1,2}:\d{2} [AP]M|Just now|\d+ (?:minute|hour)s? ago|Yesterday|Today)\.")
+
+
+def parse_desc(desc):
+    """'Sender: body. 3:26 PM. 6 reactions.' -> (sender, body, meta)"""
+    desc = desc or ""
+    m = re.match(r"^(?P<sender>[^:]{1,80}): (?P<rest>.*)$", desc, re.S)
+    sender, rest = (m.group("sender"), m.group("rest")) if m else (None, desc)
+    hits = list(WHEN.finditer(rest))
+    if not hits:
+        return sender, rest.strip(), ""
+    cut = hits[0]  # the first time marker ends the body; later ones belong to "Edited …" etc.
+    body = rest[:cut.start()]
+    if rest[cut.start()] == "." and body.endswith(".."):
+        body += "."
+    return sender, body.strip(), rest[cut.start():].lstrip(". ").strip()
+
+
+def message_nodes(nodes, thread=False):
+    out = []
+    pat = re.compile(r"-thread-list-Thread_(\d+\.\d+)$") if thread else re.compile(r"^message-list_(\d+\.\d+)$")
+    for k, n in enumerate(nodes):
+        m = pat.search(n.get("id") or "")
+        if not m or not n.get("text"):
+            continue
+        sub = subtree(nodes, k)
+        sender_btn = next((s.get("text") for s in sub if "c-message__sender_button" in cls(s)), None)
+        sender, body, meta = parse_desc(n["text"])
+        replies = re.search(r"(\d+) repl", n["text"])
+        out.append({"ts": m.group(1), "time": kst(m.group(1)), "sender": sender_btn or sender,
+                    "text": body, "meta": meta, "replies": int(replies.group(1)) if replies else 0,
+                    "i": n["i"]})
+    return out
+
+
+def flexpane_start(nodes):
+    return next((n["i"] for n in nodes if re.search(r"p-flexpane|threads_flexpane", cls(n))), None)
+
+
+def open_thread(conv, ts):
+    open_conv(conv)
+    nodes = dump()
+    k = next((n["i"] for n in nodes if n.get("id") == f"message-list_{ts}"), None)
+    if k is None:
+        raise SlackError(f"message {ts} is not rendered in {conv}; only recent messages can be reached")
+    sub = subtree(nodes, k)
+    btn = next((s for s in sub if s.get("acts") and re.search(r"\d+ repl", s.get("text") or "")), None) \
+        or next((s for s in sub if s.get("acts") and s.get("text") == "Reply to thread"), None)
+    if btn:
+        act("press", f"i:{btn['i']}")
+    else:  # no replies yet: the hover-only "Reply to thread" button is not rendered, use the context menu
+        menu_pick(k, r"^Reply in thread")
+    nodes = wait_for(lambda ns: flexpane_start(ns) is not None and any("thread-list-Thread_" in (n.get("id") or "") for n in ns), timeout=5)
+    if not nodes:
+        raise SlackError("thread pane did not open")
+    return nodes
+
+
+def composer(nodes, in_thread=False):
+    fp = flexpane_start(nodes)
+    eds = [n for n in nodes if n["role"] == "AXTextArea" and "ql-editor" in cls(n)]
+    if in_thread:
+        eds = [n for n in eds if fp is not None and n["i"] > fp]
+    else:
+        eds = [n for n in eds if fp is None or n["i"] < fp]
+    if not eds:
+        raise SlackError("message box not found")
+    return eds[0]
+
+
+def fill_composer(text, in_thread=False):
+    nodes = dump()
+    ed = composer(nodes, in_thread)
+    act("set", f"i:{ed['i']}", text)
+    time.sleep(0.6)
+    nodes = dump()
+    ed = composer(nodes, in_thread)
+    if norm_text(ed.get("text")) != norm_text(text):
+        raise SlackError(f"message box shows {ed.get('text')!r}, expected the text to send")
+    return nodes, ed
+
+
+def clear_composer(in_thread=False):
+    try:
+        nodes = dump()
+        ed = composer(nodes, in_thread)
+        act("set", f"i:{ed['i']}", "")
+    except SlackError:
+        pass
+
+
+def close_popovers():
+    nodes = dump()
+    ov = next((n for n in nodes if "ReactModal__Overlay--after-open" in cls(n)), None)
+    if ov:
+        act("press", f"i:{ov['i']}")
+        time.sleep(0.5)
+
+
+def menu_pick(target_i, label_re):
+    act("menu", f"i:{target_i}")
+    nodes = wait_for(lambda ns: any(n["role"] == "AXMenuItem" for n in ns), timeout=3)
+    if not nodes:
+        raise SlackError("context menu did not open")
+    item = next((n for n in nodes if n["role"] == "AXMenuItem" and re.match(label_re, n.get("text") or "")), None)
+    if not item:
+        labels = [n.get("text") for n in nodes if n["role"] == "AXMenuItem"]
+        close_popovers()
+        raise SlackError(f"menu has no {label_re!r}: {labels}")
+    act("press", f"i:{item['i']}")
+    time.sleep(0.8)
+
+
+def parse_time(s):
+    s = s.strip().upper().replace(".", "")
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?$", s)
+    if not m:
+        raise SlackError(f"bad time {s!r}; use HH:MM (24h) or H:MM AM/PM")
+    h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+    if ap:
+        h = h % 12 + (12 if ap == "PM" else 0)
+    now = datetime.now()
+    when = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+    if when < now + timedelta(minutes=2):
+        raise SlackError(f"{when:%H:%M} is less than 2 minutes from now; Slack rejects times that close")
+    label = when.strftime("%I:%M %p").lstrip("0")
+    return when, label
+
+
+def set_schedule_time(label):
+    """In an open 'Schedule message' dialog, type an exact time and submit."""
+    nodes = wait_for(lambda ns: any("p-schedule_message__time_picker" in cls(n) for n in ns), timeout=4)
+    if not nodes:
+        raise SlackError("schedule dialog did not open")
+    def time_box(ns):
+        tp = next((n["i"] for n in ns if "p-schedule_message__time_picker" in cls(n)), None)
+        return next((n for n in ns if n["role"] == "AXComboBox" and (tp is None or n["i"] > tp)
+                     and re.search(r"\d{1,2}:\d{2}", n.get("text") or "")), None) \
+            or next((n for n in ns if n["role"] == "AXComboBox" and tp is not None and n["i"] > tp), None)
+    cb = time_box(nodes)
+    if not cb:
+        raise SlackError("time field not found in the schedule dialog")
+    act("focus", f"i:{cb['i']}")
+    act("set", f"i:{cb['i']}", "")
+    ax("type", label)
+    time.sleep(0.4)
+    ax("key", "36")
+    time.sleep(0.7)
+    nodes = dump()
+    cb = time_box(nodes) or {}
+    if norm_text(cb.get("text")) != label or "with_error" in cls(cb):
+        cancel = next((n for n in nodes if n["role"] == "AXButton" and n.get("text") == "Cancel"), None)
+        if cancel:
+            act("press", f"i:{cancel['i']}")
+        raise SlackError(f"Slack did not accept {label} (field shows {cb.get('text')!r})")
+    btn = next(n for n in nodes if n["role"] == "AXButton" and n.get("text") == "Schedule Message")
+    act("press", f"i:{btn['i']}")
+    if not wait_for(lambda ns: not any("p-schedule_message__time_picker" in cls(n) for n in ns), timeout=4):
+        raise SlackError("schedule dialog stayed open")
+
+
+# ---------------- commands ----------------
+
+def cmd_status(a):
+    t = title()
+    m = re.search(r"(\d+) new items", t)
+    return {"view": view_name(t), "title": t, "newItems": int(m.group(1)) if m else 0}
+
+
+def cmd_channels(a):
+    go_home()
+    rows = sidebar_rows(dump())
+    if a.unread:
+        rows = [r for r in rows if r["unread"]]
+    return [{k: r[k] for k in ("id", "name", "kind", "unread")} for r in rows]
+
+
+def cmd_unread(a):
+    go_home()
+    nodes = dump()
+    out = {"newItems": cmd_status(a)["newItems"], "conversations": [], "threads": False}
+    out["threads"] = any(n.get("id") == "Vall_threads" and "unread" in (n.get("text") or "") for n in nodes)
+    out["conversations"] = [{k: r[k] for k in ("id", "name", "kind")} for r in sidebar_rows(nodes) if r["unread"]]
+    out["moreUnreadsBelow"] = any(n.get("text") == "More unreads" for n in nodes)
+    return out
+
+
+def cmd_read(a):
+    open_conv(a.conversation)
+    msgs = message_nodes(dump())
+    for m in msgs:
+        m.pop("i", None)
+    return {"conversation": view_name(), "messages": msgs[-a.limit:] if a.limit else msgs,
+            "note": "only messages Slack has rendered are visible (recent ones)"}
+
+
+def cmd_thread(a):
+    nodes = open_thread(a.conversation, a.ts)
+    msgs = message_nodes(nodes, thread=True)
+    for m in msgs:
+        m.pop("i", None)
+    return {"conversation": view_name(), "thread": a.ts, "messages": msgs}
+
+
+def activity_open(tab):
+    act("press", "#activity-inbox")
+    wait_for(lambda ns: any(n.get("id") == "Av01" for n in ns), timeout=5)
+    act("press", {"all": "#Av01", "dms": "#Av02", "mentions": "#Av03", "threads": "#Av04"}[tab])
+    time.sleep(1.0)
+
+
+def activity_items(nodes):
+    items = []
+    for n in nodes:
+        if n["role"] == "AXGroup" and "c-virtual_list__item" in cls(n) and n.get("id") and n.get("text"):
+            items.append({"id": n["id"], "kind": n["id"].split("-")[0], "text": n["text"], "i": n["i"]})
+    return items
+
+
+def filter_checkbox(nodes):
+    return next((n for n in nodes if n["role"] == "AXCheckBox" and n.get("text") == "Filter unreads"), None)
+
+
+def cmd_activity(a):
+    if a.action == "mark":
+        return activity_mark(a)
+    activity_open(a.tab)
+    nodes = dump()
+    toggled = False
+    if a.unread:
+        cb = filter_checkbox(nodes)
+        if cb and not cb.get("val"):
+            act("press", f"i:{cb['i']}")
+            toggled = True
+            time.sleep(1.2)
+    seen = {}
+    for _ in range(8):
+        nodes = dump()
+        before = len(seen)
+        for it in activity_items(nodes):
+            seen.setdefault(it["id"], it)
+        if len(seen) >= a.limit or (len(seen) == before and _ > 0):
+            break
+        items = activity_items(nodes)
+        if items:
+            ax("show", f"i:{items[-1]['i']}")
+            time.sleep(0.9)
+    header = next((n.get("text") for n in nodes if n.get("id") == "Av01"), "")
+    if toggled:
+        cb = filter_checkbox(dump())
+        if cb:
+            act("press", f"i:{cb['i']}")
+    items = list(seen.values())[: a.limit]
+    for it in items:
+        it.pop("i", None)
+    return {"tab": a.tab, "header": header, "unreadOnly": a.unread, "items": items}
+
+
+def activity_mark(a):
+    if not a.item or a.state not in ("read", "unread"):
+        raise SlackError("usage: slackctl activity mark <item-id> read|unread")
+    activity_open(a.tab)
+    nodes = dump()
+    it = next((x for x in activity_items(nodes) if x["id"] == a.item), None)
+    if not it:
+        raise SlackError(f"activity item not rendered: {a.item}")
+    menu_pick(it["i"], r"^Mark (as )?read" if a.state == "read" else r"^Mark (as )?unread")
+    close_popovers()
+    return {"item": a.item, "marked": a.state, "header": next((n.get("text") for n in dump() if n.get("id") == "Av01"), "")}
+
+
+def scheduled_open():
+    go_home()
+    act("press", "i:%d" % (next(n["i"] for n in dump() if n.get("id") == "Pdrafts") + 1))
+    nodes = wait_for(lambda ns: any(n["role"] == "AXRadioButton" and (n.get("text") or "").startswith("Scheduled") for n in ns), timeout=5)
+    tab = next(n for n in nodes if n["role"] == "AXRadioButton" and (n.get("text") or "").startswith("Scheduled"))
+    act("press", f"i:{tab['i']}")
+    time.sleep(1.2)
+    return dump()
+
+
+def scheduled_items(nodes):
+    out = []
+    for k, n in enumerate(nodes):
+        t = n.get("text") or ""
+        m = re.match(r"^Message to (?P<to>.+?), scheduled to send (?P<when>.+?)\. Summary: (?P<text>.*)$", t, re.S)
+        if n["role"] == "AXGroup" and m:
+            out.append({"id": n.get("id"), "to": m.group("to"), "when": m.group("when"), "text": m.group("text"), "i": n["i"]})
+    return out
+
+
+def cmd_scheduled(a):
+    nodes = scheduled_open()
+    items = scheduled_items(nodes)
+    if a.action in (None, "list"):
+        for x in items:
+            x.pop("i", None)
+        return {"scheduled": items}
+    if not a.target:
+        raise SlackError("give the scheduled message: its number (1 = first) or id")
+    pick = items[int(a.target) - 1] if a.target.isdigit() and int(a.target) <= len(items) else next((x for x in items if x["id"] == a.target), None)
+    if not pick:
+        raise SlackError(f"no scheduled message {a.target}")
+    preview = {k: pick[k] for k in ("id", "to", "when", "text")}
+    sub = subtree(nodes, next(k for k, n in enumerate(nodes) if n["i"] == pick["i"]))
+    if a.action == "reschedule":
+        when, label = parse_time(a.time or "")
+        if not a.yes:
+            return {"dryRun": True, "reschedule": preview, "to": label}
+        btn = next(s for s in sub if s.get("text") == "Reschedule message")
+        act("press", f"i:{btn['i']}")
+        set_schedule_time(label)
+        wait_for(lambda ns: any(x["id"] == pick["id"] and label in x["when"] for x in scheduled_items(ns)), timeout=4)
+        return {"rescheduled": preview["id"], "now": [x["when"] for x in scheduled_items(dump()) if x["id"] == pick["id"]]}
+    if a.action == "delete":
+        if not a.yes:
+            return {"dryRun": True, "delete": preview}
+        more = next(s for s in sub if s.get("text") == "More actions")
+        act("press", f"i:{more['i']}")
+        nodes = wait_for(lambda ns: any(n["role"] == "AXMenuItem" and re.match(r"^Delete", n.get("text") or "") for n in ns), timeout=3)
+        item = next(n for n in nodes if n["role"] == "AXMenuItem" and re.match(r"^Delete", n.get("text") or ""))
+        act("press", f"i:{item['i']}")
+        nodes = wait_for(lambda ns: any(n["role"] == "AXButton" and n.get("text") == "Delete" for n in ns), timeout=3)
+        if nodes:
+            act("press", "i:%d" % next(n["i"] for n in nodes if n["role"] == "AXButton" and n.get("text") == "Delete"))
+            time.sleep(1.0)
+        left = [x["id"] for x in scheduled_items(dump())]
+        return {"deleted": pick["id"], "stillListed": pick["id"] in left}
+    raise SlackError(f"unknown scheduled action {a.action}")
+
+
+def cmd_send(a):
+    target = {"conversation": a.conversation, "thread": a.thread, "text": a.text}
+    if not a.yes:
+        return {"dryRun": True, "send": target}
+    if a.thread:
+        open_thread(a.conversation, a.thread)
+    else:
+        open_conv(a.conversation)
+    nodes, ed = fill_composer(a.text, in_thread=bool(a.thread))
+    btn = next((n for n in nodes if n["i"] > ed["i"] and n["role"] == "AXButton" and n.get("text") == "Send now"), None)
+    if not btn:
+        clear_composer(bool(a.thread))
+        raise SlackError("send button not found")
+    act("press", f"i:{btn['i']}")
+    time.sleep(1.5)
+    nodes = dump()
+    msgs = message_nodes(nodes, thread=bool(a.thread))
+    last = msgs[-1] if msgs else None
+    ok = bool(last and norm_text(a.text)[:40] in norm_text(last["text"]))
+    return {"sent": ok, "conversation": view_name(), "last": last and {k: last[k] for k in ("ts", "time", "sender", "text")}}
+
+
+def cmd_schedule(a):
+    when, label = parse_time(a.time)
+    target = {"conversation": a.conversation, "at": when.strftime("%Y-%m-%d %H:%M"), "text": a.text}
+    if not a.yes:
+        return {"dryRun": True, "schedule": target}
+    open_conv(a.conversation)
+    nodes, ed = fill_composer(a.text)
+    pop = next(n for n in nodes if n["i"] > ed["i"] and n["role"] == "AXPopUpButton" and n.get("text") == "Schedule for later")
+    act("press", f"i:{pop['i']}")
+    nodes = wait_for(lambda ns: any(n["role"] == "AXMenuItem" and (n.get("text") or "").startswith("Custom time") for n in ns), timeout=3)
+    if not nodes:
+        clear_composer()
+        raise SlackError("schedule menu did not open")
+    act("press", "i:%d" % next(n["i"] for n in nodes if n["role"] == "AXMenuItem" and (n.get("text") or "").startswith("Custom time")))
+    try:
+        set_schedule_time(label)
+    except SlackError:
+        clear_composer()
+        raise
+    time.sleep(0.8)
+    banner = next((n.get("text") for n in dump() if re.match(r"^Your message will be sent", n.get("text") or "")), None)
+    return {"scheduled": bool(banner), "banner": banner, **target}
+
+
+def find_message(a):
+    if a.thread:
+        nodes = open_thread(a.conversation, a.thread)
+        msgs = message_nodes(nodes, thread=True)
+    else:
+        open_conv(a.conversation)
+        nodes = dump()
+        msgs = message_nodes(nodes)
+    m = next((x for x in msgs if x["ts"] == a.ts), None)
+    if not m:
+        raise SlackError(f"message {a.ts} is not rendered")
+    return nodes, m
+
+
+def cmd_edit(a):
+    if not a.yes:
+        return {"dryRun": True, "edit": {"conversation": a.conversation, "ts": a.ts, "thread": a.thread, "text": a.text}}
+    nodes, m = find_message(a)
+    old = m["text"]
+    menu_pick(m["i"], r"^Edit message")
+    nodes = dump()
+    eds = [n for n in nodes if n["role"] == "AXTextArea" and "ql-editor" in cls(n) and norm_text(n.get("text"))[:30] == norm_text(old)[:30]]
+    if not eds:
+        raise SlackError("edit box did not open")
+    act("set", f"i:{eds[0]['i']}", a.text)
+    time.sleep(0.6)
+    nodes = dump()
+    save = next((n for n in nodes if n["i"] > eds[0]["i"] and n["role"] == "AXButton" and n.get("text") == "Save"), None)
+    if not save:
+        raise SlackError("Save button not found")
+    act("press", f"i:{save['i']}")
+    time.sleep(1.5)
+    msgs = message_nodes(dump(), thread=bool(a.thread))
+    now = next((x for x in msgs if x["ts"] == a.ts), None)
+    return {"edited": bool(now and norm_text(a.text)[:40] in norm_text(now["text"])), "text": now and now["text"]}
+
+
+def cmd_forward(a):
+    if not a.yes:
+        return {"dryRun": True, "forward": {"conversation": a.conversation, "ts": a.ts, "to": a.to, "comment": a.comment}}
+    to = a.to.strip()
+    if to.lower() in ("@me", "me", "self"):
+        go_home()
+        me = next((r for r in sidebar_rows(dump()) if r["you"]), None)
+        if not me:
+            raise SlackError("could not find your own DM in the sidebar")
+        to = me["name"]
+    to = to.lstrip("@#")
+    nodes, m = find_message(a)
+    menu_pick(m["i"], r"^Forward message")
+    nodes = wait_for(lambda ns: any(n["role"] == "AXComboBox" for n in ns), timeout=4)
+    if not nodes:
+        raise SlackError("forward dialog did not open")
+    cb = next(n for n in nodes if n["role"] == "AXComboBox")
+    act("focus", f"i:{cb['i']}")
+    # Typed text reaches the box but not Slack's search state, so the list is not filtered. Typing the
+    # first word and pressing Down opens Slack's suggestion list (recent conversations); pick from it.
+    ax("type", to.split()[0])
+    time.sleep(0.8)
+    ax("key", "125")
+    want = re.sub(r"\s+", "", to.lower())
+    opt_pred = lambda n: "p-share_dialog_channel_picker__option" in cls(n) and want in re.sub(r"\s+", "", (n.get("text") or "").lower())
+    nodes = wait_for(lambda ns: any(opt_pred(n) for n in ns), timeout=4)
+    if not nodes:
+        ns = dump()
+        shown = [n.get("text") for n in ns if "p-share_dialog_channel_picker__option" in cls(n)]
+        cancel = next((n for n in ns if n["role"] == "AXButton" and n.get("text") in ("Cancel", "Close")), None)
+        if cancel:
+            act("press", f"i:{cancel['i']}")
+        close_popovers()
+        raise SlackError(f"{a.to} is not in Slack's suggestion list (only recent conversations can be picked): {shown}")
+    act("press", "i:%d" % next(n["i"] for n in nodes if opt_pred(n)))
+    time.sleep(0.6)
+    if a.comment:
+        nodes = dump()
+        ed = next(n for n in nodes if n["role"] == "AXTextArea" and "ql-editor" in cls(n))
+        act("set", f"i:{ed['i']}", a.comment)
+    nodes = dump()
+    btn = next((n for n in nodes if n["role"] == "AXButton" and n.get("text") == "Forward"), None)
+    if not btn:
+        raise SlackError("Forward button not found")
+    act("press", f"i:{btn['i']}")
+    done = wait_for(lambda ns: not any(n.get("text") == "Forward" and n["role"] == "AXButton" for n in ns), timeout=4)
+    return {"forwarded": bool(done), "to": a.to}
+
+
+# ---------------- output ----------------
+
+def show(cmd, d):
+    if isinstance(d, dict) and d.get("dryRun"):
+        print("dry run (add --yes to do it):")
+        print(json.dumps({k: v for k, v in d.items() if k != "dryRun"}, ensure_ascii=False, indent=2))
+        return
+    if cmd == "status":
+        print(f"{d['view']}  ({d['newItems']} new items)")
+    elif cmd == "channels":
+        for r in d:
+            print(f"{'●' if r['unread'] else ' '} {r['name']:<34} {r['kind']:<9} {r['id']}")
+    elif cmd == "unread":
+        print(f"{d['newItems']} new items" + ("  · Threads has unreads" if d["threads"] else ""))
+        for r in d["conversations"]:
+            print(f"● {r['name']:<34} {r['kind']:<9} {r['id']}")
+        if d.get("moreUnreadsBelow"):
+            print("  (more unread conversations further down the sidebar)")
+    elif cmd in ("read", "thread"):
+        print(f"# {d['conversation']}" + (f" · thread {d['thread']}" if cmd == "thread" else ""))
+        for m in d["messages"]:
+            extra = f"  [{m['replies']} replies]" if m.get("replies") else ""
+            print(f"{m['time']}  {m['sender'] or '?'}: {m['text']}{extra}   ts={m['ts']}")
+    elif cmd == "activity" and "items" in d:
+        print(f"{d['header']}" + ("  (unread only)" if d["unreadOnly"] else ""))
+        for it in d["items"]:
+            print(f"- [{it['kind']}] {it['text']}\n    id={it['id']}")
+    elif cmd == "scheduled" and "scheduled" in d:
+        if not d["scheduled"]:
+            print("no scheduled messages")
+        for n, x in enumerate(d["scheduled"], 1):
+            print(f"{n}. to {x['to']} · {x['when']}: {x['text']}   id={x['id']}")
+    else:
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="slackctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    add = lambda *x, **k: sub.add_parser(*x, parents=[common], **k)
+
+    add("status", help="current Slack view and new-item count")
+    p = add("channels", help="sidebar conversations"); p.add_argument("--unread", action="store_true")
+    add("unread", help="conversations with unread messages")
+    p = add("read", help="recent messages of a channel or DM"); p.add_argument("conversation"); p.add_argument("-n", "--limit", type=int, default=20)
+    p = add("thread", help="messages of a thread"); p.add_argument("conversation"); p.add_argument("ts")
+    p = add("activity", help="notifications; 'activity mark <id> read|unread'")
+    p.add_argument("action", nargs="?", choices=["list", "mark"]); p.add_argument("item", nargs="?"); p.add_argument("state", nargs="?")
+    p.add_argument("--unread", action="store_true"); p.add_argument("--tab", choices=["all", "dms", "mentions", "threads"], default="all")
+    p.add_argument("-n", "--limit", type=int, default=30)
+    p = add("scheduled", help="scheduled messages; 'scheduled reschedule <n|id> <time>' / 'scheduled delete <n|id>'")
+    p.add_argument("action", nargs="?", choices=["list", "reschedule", "delete"]); p.add_argument("target", nargs="?"); p.add_argument("time", nargs="?")
+    p.add_argument("--yes", action="store_true")
+    p = add("send", help="send a message (or a thread reply with --thread ts)")
+    p.add_argument("conversation"); p.add_argument("text"); p.add_argument("--thread"); p.add_argument("--yes", action="store_true")
+    p = add("schedule", help="schedule a message for an exact time today")
+    p.add_argument("conversation"); p.add_argument("time"); p.add_argument("text"); p.add_argument("--yes", action="store_true")
+    p = add("edit", help="edit one of your messages")
+    p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("text"); p.add_argument("--thread"); p.add_argument("--yes", action="store_true")
+    p = add("forward", help="forward a message to a person or channel")
+    p.add_argument("conversation"); p.add_argument("ts"); p.add_argument("--to", required=True); p.add_argument("--comment")
+    p.add_argument("--thread"); p.add_argument("--yes", action="store_true")
+
+    a = ap.parse_args()
+    fn = globals()["cmd_" + a.cmd]
+    try:
+        data = fn(a)
+    except SlackError as e:
+        sys.exit(f"slackctl: {e}")
+    except subprocess.TimeoutExpired:
+        sys.exit("slackctl: Slack did not answer in time")
+    if a.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        show(a.cmd, data)
+
+
+if __name__ == "__main__":
+    main()

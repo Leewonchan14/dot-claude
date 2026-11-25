@@ -1,0 +1,9 @@
+{
+  "name": "mac-tools",
+  "description": "macOS-only CLIs for desktop apps: Mail.app (mailctl), Slack (slackctl), Notion (notionctl)",
+  "author": {
+    "name": "WonChan Lee"
+  },
+  "repository": "https://github.com/Leewonchan14/dot-claude",
+  "license": "MIT"
+}

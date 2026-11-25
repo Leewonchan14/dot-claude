@@ -1,0 +1,760 @@
+#!/usr/bin/env node
+/*
+notionctl - read and drive the Notion desktop app through the Chrome DevTools Protocol (CDP),
+without bringing Notion to the front or moving the mouse.
+
+Notion must run with a local debugging port: "notionctl launch --yes" restarts it that way
+(127.0.0.1:9333). "notionctl launch --normal --yes" restarts it without the port.
+
+Pages are addressed by an open tab: a Notion URL, a page id (32 hex, dashes optional) or a
+title substring. Only tabs that are already open (and loaded) can be used.
+
+"notionctl open" puts a page into a tab first: by URL/id (into the blank tab, or --in <tab>), or by
+following a sub-page link inside an open page. Notion only renders the blocks near the scroll position;
+"blocks" and "read" scroll through the whole page (--visible reads only what is rendered).
+
+Write commands (move, edit, append, image add, file add, db sort, launch) print a preview and do
+nothing unless --yes is given.
+
+Examples
+  notionctl status
+  notionctl open https://app.notion.com/p/<page-id>
+  notionctl open "Parent page" "Child page"    # follow a sub-page link in an open page
+  notionctl blocks ctl
+  notionctl read ctl
+  notionctl move ctl "Block C" up --yes
+  notionctl edit ctl 3 "Block C" --yes
+  notionctl append ctl "new line" --after "Block C" --yes
+  notionctl image list ctl
+  notionctl image read ctl 1 -o /tmp/img.png
+  notionctl image add ctl ./pic.png --after "Block C" --yes
+  notionctl file add ctl ./doc.pdf --after "Block C" --yes
+  notionctl db list ctl
+  notionctl db rows ctl
+  notionctl db view ctl "By Status"
+  notionctl db sort ctl "Due date" desc --yes
+  notionctl db sort ctl --clear --yes
+  notionctl db search ctl "release"
+  notionctl screenshot ctl -o /tmp/page.png
+*/
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync, spawnSync } = require('child_process');
+
+const PORT = Number(process.env.NOTIONCTL_PORT || 9333);
+const BASE = 'http://127.0.0.1:' + PORT;
+const CACHE = path.join(os.homedir(), 'Library/Caches/notionctl');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const FENCE = '\x60\x60\x60';
+
+class CtlError extends Error {}
+
+// ---------------- CDP ----------------
+
+async function cdpUp() {
+  try {
+    const r = await fetch(BASE + '/json/version', { signal: AbortSignal.timeout(2000) });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
+async function requireCdp() {
+  if (await cdpUp()) return;
+  const running = spawnSync('pgrep', ['-x', 'Notion']).status === 0;
+  throw new CtlError(running
+    ? 'Notion is running without the debugging port. Run: notionctl launch --yes (restarts Notion; tabs are restored)'
+    : 'Notion is not running. Run: notionctl launch --yes');
+}
+
+async function targets() {
+  const list = await (await fetch(BASE + '/json/list')).json();
+  return list.filter((t) => t.type === 'page' && t.url.startsWith('https://app.notion.com/'));
+}
+
+function pageIdOf(url) {
+  const s = String(url || '').split('?')[0].split('#')[0].replace(/-/g, '');
+  const m = s.match(/([0-9a-f]{32})$/i) || s.match(/([0-9a-f]{32})/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+async function findTab(ref) {
+  const tabs = await targets();
+  const id = pageIdOf(ref);
+  let hits = [];
+  if (id) hits = tabs.filter((t) => pageIdOf(t.url) === id);
+  if (!hits.length) hits = tabs.filter((t) => t.title === ref);
+  if (!hits.length) hits = tabs.filter((t) => t.title.toLowerCase().includes(String(ref).toLowerCase()));
+  if (!hits.length) throw new CtlError('no open Notion tab matches "' + ref + '". Open the page in Notion first. Open tabs:\n' + tabs.map((t) => '  ' + (t.title || '(not loaded)') + '  ' + t.url.split('?')[0]).join('\n'));
+  if (hits.length > 1 && !id) {
+    const exact = hits.filter((t) => t.title === ref);
+    if (exact.length === 1) hits = exact;
+    else throw new CtlError('"' + ref + '" matches several tabs; use the URL or page id:\n' + hits.map((t) => '  ' + t.title + '  ' + t.url.split('?')[0]).join('\n'));
+  }
+  return hits[0];
+}
+
+class Page {
+  static async open(ref) {
+    await requireCdp();
+    const tab = await findTab(ref);
+    const p = new Page(tab);
+    await p.connect();
+    return p;
+  }
+  constructor(tab) { this.tab = tab; this.id = 0; this.pending = new Map(); }
+  async connect() {
+    this.ws = new WebSocket(this.tab.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = () => rej(new CtlError('cannot connect to the Notion tab')); });
+    this.ws.onmessage = (m) => {
+      const d = JSON.parse(m.data);
+      if (d.id && this.pending.has(d.id)) { this.pending.get(d.id)(d); this.pending.delete(d.id); }
+    };
+  }
+  close() { try { this.ws.close(); } catch {} }
+  send(method, params = {}) {
+    return new Promise((res, rej) => {
+      const i = ++this.id;
+      const timer = setTimeout(() => { this.pending.delete(i); rej(new CtlError('CDP timeout: ' + method)); }, 30000);
+      this.pending.set(i, (d) => { clearTimeout(timer); d.error ? rej(new CtlError(method + ': ' + d.error.message)) : res(d.result); });
+      this.ws.send(JSON.stringify({ id: i, method, params }));
+    });
+  }
+  async eval(fnSource, ...args) {
+    const expr = '(' + fnSource + ')(...' + JSON.stringify(args) + ')';
+    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+    if (r.exceptionDetails) throw new CtlError('page script failed: ' + String((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text).split('\n')[0]);
+    return r.result.value;
+  }
+  async click(pt, count = 1) {
+    if (!pt) throw new CtlError('nothing to click');
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y });
+    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pt.x, y: pt.y, button: 'left', clickCount: count });
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: count });
+    await sleep(500);
+  }
+  async mouseAway() { await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 }); }
+  async key(name, modifiers = 0) {
+    const K = { Enter: [13, 'Enter'], Escape: [27, 'Escape'], ArrowUp: [38, 'ArrowUp'], ArrowDown: [40, 'ArrowDown'], ArrowRight: [39, 'ArrowRight'], End: [35, 'End'], Backspace: [8, 'Backspace'] }[name];
+    const base = { key: name, code: K[1], windowsVirtualKeyCode: K[0], nativeVirtualKeyCode: K[0], modifiers };
+    await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
+    if (K[2] && !modifiers) await this.send('Input.dispatchKeyEvent', { type: 'char', text: K[2], ...base });
+    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+    await sleep(350);
+  }
+  async insertText(text) { await this.send('Input.insertText', { text }); await sleep(200); }
+}
+const MOD = { alt: 1, ctrl: 2, cmd: 4, shift: 8 };
+
+// ---------------- page scripts (run inside Notion) ----------------
+
+const JS_BLOCKS = String(function (all) {
+  const root = document.querySelector('.notion-page-content');
+  if (!root) return { error: 'no page content rendered (unloaded tab, or a full-page database)' };
+  const out = [];
+  const parentBlock = (b) => { const p = b.parentElement && b.parentElement.closest('[data-block-id]'); return p && root.contains(p) ? p : null; };
+  const seen = new Set();
+  for (const b of root.querySelectorAll('[data-block-id]')) {
+    if (b.classList.contains('notion-selectable-drag-handle') && [...root.querySelectorAll('[data-block-id="' + b.dataset.blockId + '"]')].length > 1) continue;
+    if (seen.has(b.dataset.blockId)) continue;
+    seen.add(b.dataset.blockId);
+    const inDb = b.parentElement && b.parentElement.closest('.notion-collection_view-block, .notion-collection_view_page-block');
+    if (inDb && root.contains(inDb)) continue;
+    let depth = 0; let p = parentBlock(b);
+    while (p) { depth++; p = parentBlock(p); }
+    if (!all && depth) continue;
+    const type = ([...b.classList].find((c) => /^notion-.+-block$/.test(c)) || 'notion-unknown-block').replace(/^notion-|-block$/g, '');
+    const leaf = [...b.querySelectorAll('[data-content-editable-leaf="true"], [contenteditable="true"]')].find((e) => e.closest('[data-block-id]') === b);
+    let text = leaf ? leaf.innerText : '';
+    const info = {};
+    if (type === 'image') { const img = b.querySelector('img'); info.src = img ? (img.currentSrc || img.src) : null; info.size = img ? [img.naturalWidth, img.naturalHeight] : null; }
+    if (type === 'collection_view' || type === 'collection_view_page') { info.views = [...b.querySelectorAll('[role=tab]')].map((t) => (t.getAttribute('aria-selected') === 'true' ? '*' : '') + t.innerText.trim()); }
+    if (type === 'to_do') { const c = b.querySelector('[role=checkbox], input[type=checkbox]'); info.checked = c ? (c.getAttribute('aria-checked') === 'true' || c.checked === true) : null; }
+    if (!leaf && type !== 'image') text = (b.innerText || '').split('\n').filter(Boolean)[0] || '';
+    out.push({ id: b.dataset.blockId, type, depth, text: text.replace(/​/g, ''), ...info });
+  }
+  const t = document.querySelector('.notion-frame .notion-page-block [contenteditable], .notion-frame h1');
+  return { title: t ? t.innerText.trim() : document.title, blocks: out };
+});
+
+const JS_BLOCK_POINT = String(function (id, where) {
+  const _all = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"]')]; const b = _all.find((x) => [...x.querySelectorAll('[data-content-editable-leaf="true"]')].some((e) => e.closest('[data-block-id]') === x)) || _all.find((x) => !x.classList.contains('notion-selectable-drag-handle')) || _all[0];
+  if (!b) return null;
+  b.scrollIntoView({ block: 'center' });
+  const leaf = [...b.querySelectorAll('[data-content-editable-leaf="true"], [contenteditable="true"]')].find((e) => e.closest('[data-block-id]') === b);
+  const el = leaf || b;
+  const r = el.getBoundingClientRect();
+  if (where === 'head' && leaf) {
+    const rng = document.createRange(); rng.selectNodeContents(leaf); const f = rng.getClientRects()[0];
+    if (f) return { x: f.left + 1, y: f.top + f.height / 2, editable: true };
+    return { x: r.left + 4, y: r.top + r.height / 2, editable: true };
+  }
+  if (where === 'end' && leaf) {
+    const rng = document.createRange(); rng.selectNodeContents(leaf); const rs = rng.getClientRects();
+    const last = rs[rs.length - 1];
+    if (last) return { x: Math.min(r.right - 3, last.right + 2), y: last.top + last.height / 2, editable: true };
+    return { x: r.left + 4, y: r.top + r.height / 2, editable: true };
+  }
+  return { x: r.left + Math.min(20, r.width / 2), y: r.top + Math.min(15, r.height / 2), editable: !!leaf };
+});
+
+const JS_CARET_BLOCK = String(function () {
+  const s = getSelection(); const n = s && s.anchorNode;
+  const e = n && (n.nodeType === 1 ? n : n.parentElement);
+  const b = e && e.closest('[data-block-id]');
+  return b ? b.dataset.blockId : null;
+});
+
+const JS_CARET_INFO = String(function () {
+  const s = getSelection(); const n = s && s.anchorNode;
+  const e = n && (n.nodeType === 1 ? n : n.parentElement);
+  const b = e && e.closest('[data-block-id]');
+  if (!b) return null;
+  const leaf = e.closest('[data-content-editable-leaf]');
+  const text = (leaf ? leaf.innerText : b.innerText).split(String.fromCharCode(8203)).join('').trim();
+  let atStart = false; let atEnd = false;
+  if (leaf) {
+    const r1 = document.createRange(); r1.selectNodeContents(leaf); r1.setEnd(s.anchorNode, s.anchorOffset); atStart = r1.toString().length === 0;
+    const r2 = document.createRange(); r2.selectNodeContents(leaf); r2.setStart(s.anchorNode, s.anchorOffset); atEnd = r2.toString().length === 0;
+  }
+  return { id: b.dataset.blockId, empty: !text, atStart, atEnd };
+});
+
+const JS_SCROLL = String(function (y) {
+  const sc = document.querySelector('.notion-frame .notion-scroller');
+  if (!sc) return null;
+  if (y != null) sc.scrollTop = y;
+  return { top: sc.scrollTop, h: sc.scrollHeight, vh: sc.clientHeight };
+});
+
+const JS_REVEAL = String(function (id) {
+  const b = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"]')].find((x) => !x.classList.contains('notion-selectable-drag-handle'));
+  if (!b) return false;
+  b.scrollIntoView({ block: 'center' });
+  return true;
+});
+
+const JS_DB_LIST_FN = 'function dbBlocks(){const root=document.querySelector(".notion-page-content")||document;return [...root.querySelectorAll(".notion-collection_view-block, .notion-collection_view_page-block")].filter((x)=>!(x.parentElement&&x.parentElement.closest(".notion-collection_view-block, .notion-collection_view_page-block")));}';
+
+const JS_DBS = String(function () {
+  return dbBlocks().map((b, i) => {
+    const titleEl = [...b.querySelectorAll('[contenteditable]')].find((e) => !e.closest('.notion-collection-item') && !e.closest('.notion-collection-view-body'));
+    const views = [...b.querySelectorAll('[role=tab]')].map((t) => ({ name: t.innerText.trim(), active: t.getAttribute('aria-selected') === 'true' }));
+    const kind = b.querySelector('.notion-table-view') ? 'table' : b.querySelector('.notion-board-view') ? 'board' : b.querySelector('.notion-gallery-view') ? 'gallery' : b.querySelector('.notion-list-view') ? 'list' : b.querySelector('.notion-calendar-view') ? 'calendar' : b.querySelector('.notion-timeline-view') ? 'timeline' : 'other';
+    const more = [...b.querySelectorAll('[role=tablist] [role=button]')].map((x) => x.innerText.trim()).find((x) => /more…$/.test(x));
+    return { n: i + 1, id: b.dataset.blockId, title: titleEl ? titleEl.innerText.trim() : '', views, moreViews: more ? parseInt(more, 10) || 0 : 0, layout: kind, rows: b.querySelectorAll('.notion-collection-item').length };
+  });
+}).replace('{', '{' + JS_DB_LIST_FN);
+
+const JS_DB_ROWS = String(function (n) {
+  const b = dbBlocks()[n - 1];
+  if (!b) return null;
+  const header = [...b.querySelectorAll('.notion-table-view-header-cell')].map((h) => h.innerText.trim());
+  if (b.querySelector('.notion-table-view')) {
+    const rows = [...b.querySelectorAll('.notion-collection-item')].map((r) => ({ id: r.dataset.blockId, cells: [...r.querySelectorAll('.notion-table-view-cell')].map((c) => c.innerText.trim().replace(/\n+/g, ', ')) }));
+    return { layout: 'table', header, rows };
+  }
+  const groups = [...b.querySelectorAll('.notion-board-group')];
+  if (groups.length) {
+    return { layout: 'board', groups: groups.map((g) => ({ cards: [...g.querySelectorAll('.notion-collection-item')].map((c) => ({ id: c.dataset.blockId, text: c.innerText.trim().replace(/\n+/g, ' | ') })) })) };
+  }
+  return { layout: 'other', items: [...b.querySelectorAll('.notion-collection-item')].map((c) => ({ id: c.dataset.blockId, text: c.innerText.trim().replace(/\n+/g, ' | ') })) };
+}).replace('{', '{' + JS_DB_LIST_FN);
+
+const JS_DB_POINT = String(function (n, what, name) {
+  const b = dbBlocks()[n - 1];
+  if (!b) return { error: 'no database #' + n };
+  let el = null;
+  const tabs = [...b.querySelectorAll('[role=tab]')];
+  if (what === 'tab') el = tabs.find((t) => t.innerText.trim() === name) || tabs.find((t) => t.innerText.trim().toLowerCase() === String(name).toLowerCase());
+  if (what === 'sort') el = b.querySelector('[aria-label="Sort"]');
+  if (what === 'search') el = b.querySelector('[aria-label="Search"]');
+  if (what === 'more') el = [...b.querySelectorAll('[role=tablist] [role=button]')].find((x) => /more…$/.test(x.innerText.trim()));
+  if (!el) return { error: what + ' not found', tabs: tabs.map((t) => t.innerText.trim()) };
+  el.scrollIntoView({ block: 'center' });
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}).replace('{', '{' + JS_DB_LIST_FN);
+
+const JS_OVERLAY = String(function (role, text, which) {
+  const o = document.querySelector('.notion-overlay-container');
+  if (!o) return { items: [] };
+  const dialogs = [...o.querySelectorAll('[role=dialog]')];
+  const scope = which === 'last' && dialogs.length ? dialogs[dialogs.length - 1] : o;
+  const items = [...scope.querySelectorAll('[role=' + role + ']')].filter((e) => e.innerText.trim());
+  if (text == null) return { items: items.map((e) => e.innerText.trim()) };
+  const t = typeof text === 'number' ? items[text] : (items.find((e) => e.innerText.trim() === text) || items.find((e) => e.innerText.trim().toLowerCase() === String(text).toLowerCase()));
+  if (!t) return { error: 'not found', items: items.map((e) => e.innerText.trim()) };
+  const r = t.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, label: t.innerText.trim() };
+});
+
+// ---------------- helpers ----------------
+
+async function getBlocks(p, all = false) {
+  const r = await p.eval(JS_BLOCKS, all);
+  if (r.error) throw new CtlError(r.error + ' - click the tab once in Notion so it renders');
+  return r;
+}
+
+// Notion renders only the blocks near the scroll position. Scroll through the page and merge the windows.
+async function pageBlocks(p, all = false) {
+  const s0 = await p.eval(JS_SCROLL, null);
+  const first = await getBlocks(p, all);
+  if (!s0 || s0.h <= s0.vh + 10) return first;
+  const order = [];
+  const merge = (win) => {
+    let pos = -1;
+    for (const b of win) {
+      const k = order.findIndex((x) => x.id === b.id);
+      if (k >= 0) pos = k; else { order.splice(pos + 1, 0, b); pos++; }
+    }
+  };
+  const step = Math.max(200, Math.floor(s0.vh * 0.6));
+  let title = first.title;
+  for (let y = 0; y < 500000; y += step) {
+    const s = await p.eval(JS_SCROLL, y);
+    await sleep(300);
+    const r = await getBlocks(p, all);
+    title = r.title || title;
+    merge(r.blocks);
+    if (s.top + s.vh >= s.h - 2) break;
+  }
+  await p.eval(JS_SCROLL, s0.top);
+  await sleep(200);
+  return { title, blocks: order };
+}
+
+// Scroll until the block is rendered, then center it.
+async function reveal(p, id) {
+  if (await p.eval(JS_REVEAL, id)) { await sleep(150); return; }
+  const s0 = await p.eval(JS_SCROLL, null);
+  if (!s0) throw new CtlError('page is not scrollable and block ' + id.slice(-8) + ' is not rendered');
+  const step = Math.max(200, Math.floor(s0.vh * 0.6));
+  for (let y = 0; y < 500000; y += step) {
+    const s = await p.eval(JS_SCROLL, y);
+    await sleep(250);
+    if (await p.eval(JS_REVEAL, id)) { await sleep(200); return; }
+    if (s.top + s.vh >= s.h - 2) break;
+  }
+  throw new CtlError('block ' + id.slice(-8) + ' was not found while scrolling the page');
+}
+
+function resolveBlock(blocks, ref) {
+  const top = blocks.filter((b) => b.depth === 0);
+  if (/^\d+$/.test(ref)) {
+    const b = top[Number(ref) - 1];
+    if (!b) throw new CtlError('no block #' + ref + ' (page has ' + top.length + ' top-level blocks)');
+    return b;
+  }
+  const hex = String(ref).replace(/-/g, '').toLowerCase();
+  if (/^[0-9a-f]{6,32}$/.test(hex)) {
+    const hits = blocks.filter((b) => b.id.replace(/-/g, '').startsWith(hex) || b.id.replace(/-/g, '').endsWith(hex));
+    if (hits.length === 1) return hits[0];
+  }
+  let hits = blocks.filter((b) => b.text === ref);
+  if (!hits.length) hits = blocks.filter((b) => b.text.toLowerCase().includes(String(ref).toLowerCase()));
+  if (hits.length === 1) return hits[0];
+  if (!hits.length) throw new CtlError('no block matches "' + ref + '"');
+  throw new CtlError('"' + ref + '" matches ' + hits.length + ' blocks; use the number or id that "notionctl blocks" prints:\n' + hits.map((b) => '  ' + b.id.slice(-8) + ' ' + b.type + ' ' + b.text.slice(0, 50)).join('\n'));
+}
+
+async function caretInto(p, block, where = 'end') {
+  await reveal(p, block.id);
+  const pt = await p.eval(JS_BLOCK_POINT, block.id, where);
+  if (!pt) throw new CtlError('block is not rendered');
+  await p.click(pt);
+  if (pt.editable) {
+    const at = await p.eval(JS_CARET_BLOCK);
+    if (at !== block.id) throw new CtlError('could not place the caret in the block (caret is in ' + at + ')');
+  }
+  return pt;
+}
+
+function fmtBlock(b, i) {
+  const pad = '  '.repeat(b.depth);
+  let s = b.text;
+  if (b.type === 'image') s = '[image ' + (b.size ? b.size.join('x') : '') + ']';
+  if (b.views) s = (s || '(database)') + '  views: ' + b.views.join(', ');
+  if (b.type === 'to_do') s = (b.checked ? '[x] ' : '[ ] ') + s;
+  return pad + (i != null ? String(i).padStart(2) + '. ' : '    ') + b.id.slice(-8) + '  ' + b.type.padEnd(14) + ' ' + s.replace(/\n/g, ' / ').slice(0, 120);
+}
+
+function listTop(r) { let k = 0; return r.blocks.filter((x) => x.depth === 0).map((x) => fmtBlock(x, ++k)).join('\n'); }
+
+const MD = { header: '# ', sub_header: '## ', sub_sub_header: '### ', bulleted_list: '- ', numbered_list: '1. ', quote: '> ', callout: '> ', toggle: '> ' };
+
+function out(args, obj, text) {
+  if (args.json) console.log(JSON.stringify(obj, null, 2));
+  else console.log(text);
+}
+
+function needYes(args, preview) {
+  if (args.yes) return false;
+  console.log('[preview] ' + preview + '\n(add --yes to do it)');
+  return true;
+}
+
+function parseArgs(argv) {
+  const a = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const x = argv[i];
+    if (x === '--yes' || x === '-y') a.yes = true;
+    else if (x === '--json') a.json = true;
+    else if (x === '--normal') a.normal = true;
+    else if (x === '--clear') a.clear = true;
+    else if (x === '--all') a.all = true;
+    else if (x === '-o' || x === '--out') a.out = argv[++i];
+    else if (x === '-n') a.n = Number(argv[++i]);
+    else if (x === '--db') a.db = Number(argv[++i]);
+    else if (x === '--after') a.after = argv[++i];
+    else if (x === '--in') a.in = argv[++i];
+    else if (x === '--visible') a.visible = true;
+    else if (x === '-h' || x === '--help') a.help = true;
+    else a._.push(x);
+  }
+  return a;
+}
+
+async function waitFor(fn, ms = 10000, step = 300) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { const v = await fn(); if (v) return v; await sleep(step); }
+  return null;
+}
+
+function defaultAfter(blocks) { return [...blocks].reverse().find((x) => x.depth === 0); }
+
+// ---------------- commands ----------------
+
+async function cmdLaunch(a) {
+  const mode = a.normal ? 'without' : 'with';
+  if (needYes(a, 'quit Notion and start it again ' + mode + ' the debugging port (127.0.0.1:' + PORT + '); tabs are restored')) return;
+  spawnSync('osascript', ['-e', 'quit app "Notion"']);
+  const gone = await waitFor(async () => spawnSync('pgrep', ['-x', 'Notion']).status !== 0, 20000, 500);
+  if (!gone) throw new CtlError('Notion did not quit (a dialog may be open)');
+  const extra = a.normal ? [] : ['--args', '--remote-debugging-port=' + PORT, '--remote-debugging-address=127.0.0.1'];
+  execFileSync('open', ['-g', '-a', 'Notion', ...extra]);
+  if (a.normal) { console.log('Notion restarted without the debugging port.'); return; }
+  const v = await waitFor(cdpUp, 30000, 500);
+  if (!v) throw new CtlError('Notion started but the debugging port did not open');
+  console.log('Notion restarted with CDP on 127.0.0.1:' + PORT + ' (' + (v['User-Agent'].match(/Notion\/[\d.]+/) || [''])[0] + ')');
+}
+
+async function cmdStatus(a) {
+  const v = await cdpUp();
+  if (!v) {
+    const running = spawnSync('pgrep', ['-x', 'Notion']).status === 0;
+    return out(a, { cdp: false, running }, running ? 'Notion is running without the debugging port (notionctl launch --yes)' : 'Notion is not running');
+  }
+  const tabs = (await targets()).map((t) => ({ title: t.title, id: pageIdOf(t.url), url: t.url.split('?')[0], loaded: !t.url.endsWith('/blank') }));
+  out(a, { cdp: true, port: PORT, tabs }, 'CDP 127.0.0.1:' + PORT + ' (' + (v['User-Agent'].match(/Notion\/[\d.]+/) || [''])[0] + ')\n' +
+    tabs.map((t) => (t.loaded ? '  ' : '  (not loaded) ') + (t.title || '') + '  ' + t.url).join('\n'));
+}
+
+async function cmdBlocks(a) {
+  const p = await Page.open(a._[1]);
+  try {
+    const r = a.visible ? await getBlocks(p, a.all) : await pageBlocks(p, a.all);
+    let n = 0;
+    out(a, r, r.title + '\n' + r.blocks.map((b) => fmtBlock(b, b.depth === 0 ? ++n : null)).join('\n'));
+  } finally { p.close(); }
+}
+
+async function cmdRead(a) {
+  const p = await Page.open(a._[1]);
+  try {
+    const r = a.visible ? await getBlocks(p, true) : await pageBlocks(p, true);
+    const lines = ['# ' + r.title, ''];
+    for (const b of r.blocks) {
+      const pad = '  '.repeat(b.depth);
+      if (b.type === 'image') lines.push(pad + '![image](' + (b.src || '') + ')');
+      else if (b.views) lines.push(pad + '[database] ' + b.text + ' (views: ' + b.views.join(', ') + ')');
+      else if (b.type === 'to_do') lines.push(pad + (b.checked ? '- [x] ' : '- [ ] ') + b.text);
+      else if (b.type === 'divider') lines.push(pad + '---');
+      else if (b.type === 'code') lines.push(pad + FENCE + '\n' + b.text + '\n' + FENCE);
+      else if (b.text) lines.push(pad + (MD[b.type] || '') + b.text);
+    }
+    out(a, r, lines.join('\n'));
+  } finally { p.close(); }
+}
+
+async function cmdMove(a) {
+  const [, page, ref, dir] = a._;
+  const n = a.n || 1;
+  if (!ref || !['up', 'down'].includes(dir)) throw new CtlError('usage: notionctl move <page> <block> up|down [-n N] --yes');
+  const p = await Page.open(page);
+  try {
+    const before = await pageBlocks(p);
+    const b = resolveBlock(before.blocks, ref);
+    if (b.depth) throw new CtlError('only top-level blocks can be moved');
+    await reveal(p, b.id);
+    if (needYes(a, 'move ' + b.type + ' "' + b.text.slice(0, 40) + '" ' + dir + ' ' + n + ' step(s) on "' + before.title + '"')) return;
+    const editable = async (blk) => !!(await p.eval(JS_BLOCK_POINT, blk.id, 'start') || {}).editable;
+    for (let i = 0; i < n; i++) {
+      const cur = (await getBlocks(p)).blocks;
+      const idx = cur.findIndex((x) => x.id === b.id);
+      const nb = cur[dir === 'up' ? idx - 1 : idx + 1];
+      if (!nb) break;
+      if (await editable(b)) {
+        await caretInto(p, b);
+        await p.key(dir === 'up' ? 'ArrowUp' : 'ArrowDown', MOD.cmd | MOD.shift);
+      } else if (await editable(nb)) {
+        // Notion ignores the move shortcut on a selected image/database; move the text neighbour the other way
+        await caretInto(p, nb);
+        await p.key(dir === 'up' ? 'ArrowDown' : 'ArrowUp', MOD.cmd | MOD.shift);
+      } else throw new CtlError('cannot move: neither this block nor its neighbour (' + nb.type + ') has editable text');
+      await sleep(300);
+    }
+    await sleep(400);
+    await p.mouseAway();
+    const after = await pageBlocks(p);
+    const ib = before.blocks.findIndex((x) => x.id === b.id);
+    const ia = after.blocks.findIndex((x) => x.id === b.id);
+    out(a, { moved: ia !== ib, from: ib + 1, to: ia + 1, blocks: after.blocks }, (ia !== ib ? 'moved #' + (ib + 1) + ' -> #' + (ia + 1) : 'position unchanged (#' + (ib + 1) + ')') + '\n' + listTop(after));
+  } finally { p.close(); }
+}
+
+async function cmdEdit(a) {
+  const [, page, ref, text] = a._;
+  if (!ref || text == null) throw new CtlError('usage: notionctl edit <page> <block> "<new text>" --yes');
+  const p = await Page.open(page);
+  try {
+    const r = await pageBlocks(p);
+    const b = resolveBlock(r.blocks, ref);
+    if (needYes(a, 'replace the text of ' + b.type + ' "' + b.text.slice(0, 40) + '" with:\n' + text)) return;
+    const pt = await caretInto(p, b, 'end');
+    if (!pt.editable) throw new CtlError('block has no editable text (' + b.type + ')');
+    const sel = await p.eval(String(function (id) {
+      const _all = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"]')]; const b = _all.find((x) => [...x.querySelectorAll('[data-content-editable-leaf="true"]')].some((e) => e.closest('[data-block-id]') === x)) || _all.find((x) => !x.classList.contains('notion-selectable-drag-handle')) || _all[0];
+      const leaf = [...b.querySelectorAll('[data-content-editable-leaf="true"], [contenteditable="true"]')].find((e) => e.closest('[data-block-id]') === b);
+      const rng = document.createRange(); rng.selectNodeContents(leaf);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(rng);
+      return s.toString() === leaf.innerText;
+    }), b.id);
+    if (!sel) throw new CtlError('could not select the block text');
+    await p.key('Backspace');
+    if (text) await p.insertText(text);
+    await sleep(500);
+    await p.mouseAway();
+    const after = (await getBlocks(p)).blocks.find((x) => x.id === b.id);
+    out(a, after, 'now: ' + (after ? after.text : '(block gone)'));
+  } finally { p.close(); }
+}
+
+async function newBlockAfter(p, after) {
+  if (!after) throw new CtlError('no text block to insert after; give --after <block>');
+  const pt = await p.eval(JS_BLOCK_POINT, after.id, 'end');
+  if (!pt || !pt.editable) throw new CtlError('--after must be a text block (got ' + after.type + ')');
+  await caretInto(p, after, 'end');
+  const atEnd = await p.eval(String(function () { const s = getSelection(); const n = s.anchorNode; const e = n && (n.nodeType === 1 ? n : n.parentElement); const leaf = e && e.closest('[data-content-editable-leaf]'); if (!leaf) return false; const r = document.createRange(); r.selectNodeContents(leaf); r.setStart(s.anchorNode, s.anchorOffset); return r.toString().length === 0; }));
+  if (!atEnd) throw new CtlError('caret is not at the end of the block; nothing changed');
+  await p.key('Enter');
+  const now = await p.eval(JS_CARET_BLOCK);
+  if (!now || now === after.id) throw new CtlError('could not create a new block');
+  return now;
+}
+
+async function cmdAppend(a) {
+  const [, page, text] = a._;
+  if (text == null) throw new CtlError('usage: notionctl append <page> "<text>" [--after <block>] --yes');
+  const p = await Page.open(page);
+  try {
+    const r = await getBlocks(p);
+    const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
+    if (needYes(a, 'add a text block after "' + (after ? after.text.slice(0, 40) : '?') + '" on "' + r.title + '":\n' + text)) return;
+    await newBlockAfter(p, after);
+    const lines = String(text).split('\n');
+    for (let i = 0; i < lines.length; i++) { if (i) await p.key('Enter'); if (lines[i]) await p.insertText(lines[i]); }
+    await sleep(500);
+    await p.mouseAway();
+    out(a, await getBlocks(p), 'added.\n' + listTop(await getBlocks(p)));
+  } finally { p.close(); }
+}
+
+async function cmdImage(a) {
+  const sub = a._[1];
+  const p = await Page.open(a._[2]);
+  try {
+    const r = await getBlocks(p, true);
+    const imgs = r.blocks.filter((b) => b.type === 'image');
+    if (sub === 'list') {
+      return out(a, imgs, imgs.length ? imgs.map((b, i) => (i + 1) + '. ' + b.id.slice(-8) + '  ' + (b.size || []).join('x')).join('\n') : 'no images');
+    }
+    if (sub === 'read') {
+      const ref = a._[3] || '1';
+      const b = /^\d+$/.test(ref) ? imgs[Number(ref) - 1] : resolveBlock(imgs, ref);
+      if (!b) throw new CtlError('no image ' + ref + ' (page has ' + imgs.length + ')');
+      await p.mouseAway();
+      const rect = await p.eval(String(function (id) { const im = [...document.querySelectorAll('.notion-page-content [data-block-id="' + id + '"] img')].find((x) => x.naturalWidth) || document.querySelector('.notion-page-content [data-block-id="' + id + '"] img'); im.scrollIntoView({ block: 'center' }); const q = im.getBoundingClientRect(); return { x: q.left, y: q.top, w: q.width, h: q.height, nw: im.naturalWidth }; }), b.id);
+      await sleep(400);
+      const scale = rect.nw && rect.w ? Math.max(1, Math.min(3, rect.nw / rect.w)) : 1;
+      const shot = await p.send('Page.captureScreenshot', { format: 'png', clip: { x: rect.x, y: rect.y, width: rect.w, height: rect.h, scale }, captureBeyondViewport: true });
+      fs.mkdirSync(CACHE, { recursive: true });
+      const file = a.out || path.join(CACHE, 'image-' + b.id.slice(-8) + '.png');
+      fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
+      return out(a, { file, id: b.id, size: b.size }, file);
+    }
+    if (sub === 'add') {
+      const file = a._[3];
+      if (!file || !fs.existsSync(file)) throw new CtlError('usage: notionctl image add <page> <file> [--after <block>] --yes');
+      const ext = path.extname(file).slice(1).toLowerCase();
+      const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' }[ext];
+      if (!mime) throw new CtlError('unsupported image type: ' + ext);
+      const after = a.after ? resolveBlock(r.blocks, a.after) : defaultAfter(r.blocks);
+      if (needYes(a, 'upload ' + path.basename(file) + ' as an image block after "' + (after ? after.text.slice(0, 40) : '?') + '" on "' + r.title + '"')) return;
+      await newBlockAfter(p, after);
+      const b64 = fs.readFileSync(file).toString('base64');
+      const ok = await p.eval(String(function (b64, name, mime) {
+        const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+        const dt = new DataTransfer(); dt.items.add(new File([u], name, { type: mime }));
+        const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+        document.activeElement.dispatchEvent(ev); return ev.defaultPrevented;
+      }), b64, path.basename(file), mime);
+      if (!ok) throw new CtlError('Notion ignored the paste');
+      const before = imgs.length;
+      const done = await waitFor(async () => { const x = (await getBlocks(p, true)).blocks.filter((b) => b.type === 'image'); return x.length > before && x.every((i) => i.size && i.size[0] > 1) ? x : null; }, 30000, 700);
+      if (!done) throw new CtlError('image block did not finish uploading within 30s');
+      await p.mouseAway();
+      const r2 = await getBlocks(p);
+      return out(a, r2, 'uploaded.\n' + listTop(r2));
+    }
+    throw new CtlError('usage: notionctl image list|read|add <page> ...');
+  } finally { p.close(); }
+}
+
+async function overlayClick(p, role, text, which) {
+  const r = await p.eval(JS_OVERLAY, role, text, which);
+  if (r.error) throw new CtlError('menu item "' + text + '" not found; menu shows: ' + r.items.join(', '));
+  await p.click(r);
+  return r.label;
+}
+
+function rowsText(r) {
+  if (r.layout === 'table') return r.header.join(' | ') + '\n' + r.rows.map((x) => x.cells.join(' | ')).join('\n');
+  if (r.layout === 'board') return r.groups.map((g, i) => '[column ' + (i + 1) + ']\n' + g.cards.map((c) => '  ' + c.text).join('\n')).join('\n');
+  return r.items.map((c) => c.text).join('\n');
+}
+
+async function cmdDb(a) {
+  const sub = a._[1];
+  const n = a.db || 1;
+  const p = await Page.open(a._[2]);
+  try {
+    for (let i = 0; i < 3 && (await p.eval(JS_OVERLAY, 'dialog', null)).items.length; i++) await p.key('Escape');
+    const dbs = await p.eval(JS_DBS);
+    if (sub === 'list') {
+      return out(a, dbs, dbs.length ? dbs.map((d) => d.n + '. ' + d.title + '  [' + d.layout + ', ' + d.rows + ' rows]  views: ' + d.views.map((v) => (v.active ? '*' : '') + v.name).join(', ') + (d.moreViews ? ' (+' + d.moreViews + ' more)' : '')).join('\n') : 'no databases on this page');
+    }
+    const db = dbs[n - 1];
+    if (!db) throw new CtlError('no database #' + n + ' (page has ' + dbs.length + ')');
+    const active = (db.views.find((v) => v.active) || {}).name;
+    if (sub === 'rows') {
+      const r = await p.eval(JS_DB_ROWS, n);
+      return out(a, r, db.title + ' - ' + active + '\n' + rowsText(r));
+    }
+    if (sub === 'view') {
+      const name = a._[3];
+      if (!name) throw new CtlError('usage: notionctl db view <page> <view name> [--db N]');
+      const pt = await p.eval(JS_DB_POINT, n, 'tab', name);
+      if (!pt.error) await p.click(pt);
+      else {
+        const mp = await p.eval(JS_DB_POINT, n, 'more');
+        if (mp.error) throw new CtlError('view "' + name + '" not found; views: ' + (pt.tabs || []).join(', '));
+        await p.click(mp);
+        await sleep(400);
+        const opts = (await p.eval(JS_OVERLAY, 'option', null)).items.filter((x) => !/^New (view|data source)$/.test(x));
+        if (!opts.some((x) => x.toLowerCase() === name.toLowerCase())) { await p.key('Escape'); throw new CtlError('view "' + name + '" not found; views: ' + opts.join(', ')); }
+        await overlayClick(p, 'option', name);
+      }
+      await sleep(800);
+      await p.mouseAway();
+      const d2 = (await p.eval(JS_DBS))[n - 1];
+      return out(a, d2, d2.title + ': ' + d2.views.map((v) => (v.active ? '*' : '') + v.name).join(', ') + (d2.moreViews ? ' (+' + d2.moreViews + ' more)' : '') + '  [' + d2.layout + ', ' + d2.rows + ' rows]');
+    }
+    if (sub === 'sort') {
+      const prop = a._[3];
+      const dir = String(a._[4] || 'asc').toLowerCase();
+      if (!a.clear && !prop) throw new CtlError('usage: notionctl db sort <page> <property> [asc|desc] --yes  |  --clear --yes');
+      if (!['asc', 'desc'].includes(dir)) throw new CtlError('direction must be asc or desc');
+      if (needYes(a, (a.clear ? 'remove all sorts' : 'sort by "' + prop + '" ' + dir) + ' on view "' + active + '" of "' + db.title + '" (changes the shared view; replaces existing sorts)')) return;
+      const openSort = async () => { const pt = await p.eval(JS_DB_POINT, n, 'sort'); if (pt.error) throw new CtlError('sort button not found'); await p.click(pt); await sleep(400); };
+      await openSort();
+      const items = (await p.eval(JS_OVERLAY, 'menuitem', null)).items;
+      if (items.includes('Delete sort')) { await overlayClick(p, 'menuitem', 'Delete sort'); await sleep(600); if (!a.clear) await openSort(); }
+      else if (a.clear) await p.key('Escape');
+      if (a.clear) { await p.mouseAway(); return out(a, { cleared: true }, 'sorts removed'); }
+      await overlayClick(p, 'option', prop);
+      await sleep(500);
+      const btns = (await p.eval(JS_OVERLAY, 'button', null)).items;
+      const dirBtn = btns.find((x) => /^Sort /.test(x));
+      if (!dirBtn) throw new CtlError('sort rule editor not found; buttons: ' + btns.join(', '));
+      await overlayClick(p, 'button', dirBtn);
+      await sleep(400);
+      const label = await overlayClick(p, 'menuitem', dir === 'asc' ? 0 : 1, 'last');
+      await sleep(500);
+      await p.key('Escape');
+      await sleep(300);
+      await p.mouseAway();
+      const r = await p.eval(JS_DB_ROWS, n);
+      return out(a, { sorted: prop, direction: label, rows: r }, 'sorted by ' + prop + ' (' + label + ')\n' + rowsText(r));
+    }
+    if (sub === 'search') {
+      const q = a._[3] || '';
+      const FIND = String(function (n) {
+        const b = dbBlocks()[n - 1];
+        const inp = b && b.querySelector('input[placeholder*="search" i], input[type=search]');
+        if (!inp) return null;
+        inp.focus(); inp.select();
+        return { value: inp.value };
+      }).replace('{', '{' + JS_DB_LIST_FN);
+      let st = await p.eval(FIND, n);
+      if (!st) {
+        const pt = await p.eval(JS_DB_POINT, n, 'search');
+        if (pt.error) throw new CtlError('search button not found');
+        await p.click(pt);
+        st = await p.eval(FIND, n);
+        if (!st) throw new CtlError('search box did not open');
+      }
+      const focused = await p.eval(String(function () { const e = document.activeElement; return !!(e && e.tagName === 'INPUT' && /search/i.test(e.getAttribute('placeholder') || '')); }));
+      if (!focused) throw new CtlError('search box is not focused; nothing typed');
+      if (st.value) await p.key('Backspace');
+      if (q) await p.insertText(q);
+      await sleep(900);
+      await p.mouseAway();
+      const r = await p.eval(JS_DB_ROWS, n);
+      const count = r.layout === 'table' ? r.rows.length : r.layout === 'board' ? r.groups.reduce((s, g) => s + g.cards.length, 0) : r.items.length;
+      return out(a, r, (q ? 'search "' + q + '": ' : 'search cleared: ') + count + ' rows\n' + rowsText(r));
+    }
+    throw new CtlError('usage: notionctl db list|rows|view|sort|search <page> ...');
+  } finally { p.close(); }
+}
+
+async function cmdScreenshot(a) {
+  const p = await Page.open(a._[1]);
+  try {
+    await p.mouseAway();
+    const shot = await p.send('Page.captureScreenshot', { format: 'png' });
+    fs.mkdirSync(CACHE, { recursive: true });
+    const file = a.out || path.join(CACHE, 'page.png');
+    fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
+    out(a, { file }, file);
+  } finally { p.close(); }
+}
+
+const HELP = fs.readFileSync(__filename, 'utf8').split('*/')[0].replace(/^#!.*\n\/\*\n?/, '');
+
+async function main() {
+  const a = parseArgs(process.argv.slice(2));
+  const cmd = a._[0];
+  if (!cmd || a.help) { console.log(HELP); return; }
+  const table = { launch: cmdLaunch, status: cmdStatus, blocks: cmdBlocks, read: cmdRead, move: cmdMove, edit: cmdEdit, append: cmdAppend, image: cmdImage, db: cmdDb, screenshot: cmdScreenshot };
+  if (!table[cmd]) throw new CtlError('unknown command: ' + cmd + '\n' + HELP);
+  if (!['launch', 'status'].includes(cmd) && !a._[cmd === 'image' || cmd === 'db' ? 2 : 1]) throw new CtlError('missing <page> (URL, page id or tab title)');
+  await table[cmd](a);
+}
+
+main().then(() => process.exit(0)).catch((e) => {
+  console.error('error: ' + (e instanceof CtlError ? e.message : (e.stack || e)));
+  process.exit(e instanceof CtlError ? 2 : 1);
+});

@@ -1,0 +1,21 @@
+{
+  "name": "wonchan",
+  "owner": {
+    "name": "WonChan Lee"
+  },
+  "metadata": {
+    "description": "Personal Claude Code skills and plugins by Leewonchan14"
+  },
+  "plugins": [
+    {
+      "name": "my-skills",
+      "source": "./plugins/my-skills",
+      "description": "Personal skill collection"
+    },
+    {
+      "name": "mac-tools",
+      "source": "./plugins/mac-tools",
+      "description": "macOS-only CLIs for Mail.app, Slack and Notion. Install on Macs only."
+    }
+  ]
+}

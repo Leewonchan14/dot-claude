@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""mailctl - read, search and move mail in macOS Mail.app via osascript (JXA).
+
+No sending. Message refs look like  Account:Mailbox:id  (e.g. Personal:INBOX:41666)
+or a Message-Id. Ids change after a move; move commands print the new ref.
+
+Examples
+  mailctl accounts
+  mailctl list                          # newest 20 across every INBOX
+  mailctl list -a Personal --unread -n 50
+  mailctl search --from vercel -m '*'   # every mailbox of every account
+  mailctl read Personal:INBOX:41666
+  mailctl senders -a Work               # who fills the inbox
+  mailctl unsubscribe --scan 80         # senders with List-Unsubscribe
+  mailctl search --from vercel --refs | mailctl archive - --dry-run
+"""
+import argparse
+import email
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import email.parser
+from concurrent.futures import ProcessPoolExecutor
+
+sys.dont_write_bytecode = True  # keep the dotfiles skill folder free of __pycache__
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mail_db  # noqa: E402
+from datetime import datetime, timedelta
+
+CORE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mail_core.js")
+
+
+def debug(msg):
+    if os.environ.get("MAILCTL_DEBUG"):
+        print(f"[debug] {msg}", file=sys.stderr)
+
+
+def call(req, timeout):
+    t0 = time.time()
+    try:
+        p = subprocess.run(
+            ["osascript", "-l", "JavaScript", CORE, json.dumps(req, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        sys.exit(f"mailctl: Mail.app did not answer within {timeout}s (try a narrower --account/--mailbox or --timeout)")
+    if p.returncode != 0:
+        sys.exit("mailctl: osascript failed: " + (p.stderr or p.stdout).strip())
+    debug(f"Mail.app op={req.get('op')} mailbox={req.get('mailbox')}: {time.time() - t0:.2f}s")
+    out = json.loads(p.stdout)
+    if not out.get("ok"):
+        sys.exit("mailctl: " + out.get("error", "unknown error"))
+    return out["data"]
+
+
+# ---------- body search over local .emlx files ----------
+#
+# Mail.app keeps every downloaded message as ~/Library/Mail/V*/<account>/<box>.mbox/.../Messages/<id>.emlx,
+# where <id> is the same id AppleScript/JXA reports. Asking Mail for content() makes it parse and render
+# each message one Apple event at a time (~0.7 s per message); parsing the files ourselves takes ~1 ms.
+# Messages with no file on disk (never downloaded) fall back to Mail's own content().
+
+MAIL_ROOT = os.path.expanduser("~/Library/Mail")
+_TAG = re.compile(r"<[^>]+>")
+_SCRIPT = re.compile(r"(?is)<(script|style)\b.*?</\1>|<!--.*?-->")
+
+
+def norm(s):
+    return " ".join(s.casefold().split())
+
+
+def emlx_index():
+    idx = {}
+    for d, _, files in os.walk(MAIL_ROOT):
+        if not d.endswith("/Messages"):
+            continue
+        for f in files:
+            if f.endswith(".emlx"):
+                key = f.split(".")[0]
+                # prefer the full file over a .partial.emlx (attachments stripped, text kept)
+                if key not in idx or not f.endswith(".partial.emlx"):
+                    idx[key] = os.path.join(d, f)
+    return idx
+
+
+def emlx_text(path, with_id=False):
+    """Decoded text of the text/plain and text/html parts (html tags stripped)."""
+    with open(path, "rb") as fh:
+        n = int(fh.readline())
+        raw = fh.read(n)
+    # compat32 parser: same text as policy.default for search purposes, about 2x faster
+    msg = email.message_from_bytes(raw)
+    parts = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ct = part.get_content_type()
+        if ct not in ("text/plain", "text/html"):
+            continue
+        if str(part.get("Content-Disposition") or "").lower().startswith("attachment"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            s = payload.decode(charset, "replace")
+        except LookupError:
+            s = payload.decode("utf-8", "replace")
+        if ct == "text/html":
+            s = html.unescape(_TAG.sub(" ", _SCRIPT.sub(" ", s)))
+        parts.append(s)
+    text = "\n".join(parts)
+    if with_id:
+        return text, str(msg.get("Message-ID") or "").strip().strip("<>") or None
+    return text
+
+
+def _match(job):
+    """(ref, matched or None if unreadable, Message-Id, body text when matched)"""
+    ref, path, needle = job
+    try:
+        text, mid = emlx_text(path, with_id=True)
+        if needle in norm(text):
+            return ref, True, mid, " ".join(text.replace("\N{OBJECT REPLACEMENT CHARACTER}", " ").split())[:400]
+        return ref, False, None, None
+    except Exception:
+        return ref, None, None, None  # unreadable file: let Mail.app decide
+
+
+def body_filter(rows, text, timeout):
+    """Return {"Account:id": (messageId, body text) or None} for messages whose body contains text."""
+    needle = norm(text)
+    idx = emlx_index()
+    jobs, fallback, seen = [], [], set()
+    for r in rows:
+        key = (r["account"], r["id"])
+        if key in seen:  # Gmail shows one message under several label mailboxes
+            continue
+        seen.add(key)
+        path = idx.get(str(r["id"]))
+        if path:
+            jobs.append((r["ref"], path, needle))
+        else:
+            fallback.append(r["ref"])
+    if len(jobs) > 400:
+        with ProcessPoolExecutor() as ex:
+            results = list(ex.map(_match, jobs, chunksize=128))
+    else:
+        results = [_match(j) for j in jobs]
+    hits = {}
+    for ref, ok, mid, body in results:
+        if ok:
+            hits[ref_key(ref)] = (mid, body)
+        elif ok is None:
+            fallback.append(ref)
+    if fallback:
+        print(f"mailctl: {len(fallback)} message(s) have no readable .emlx, asking Mail.app (slow)", file=sys.stderr)
+        for k in call({"op": "bodyMatch", "refs": fallback, "text": text}, timeout):
+            hits[k] = None
+    return hits
+
+
+def ref_key(ref):
+    account, _, rest = ref.partition(":")
+    return account + ":" + rest.rpartition(":")[2]
+
+
+def body_search(req, timeout):
+    """Body search for list/search in one Mail.app round trip: list candidates with the other
+    filters, match bodies from .emlx files, then sort/limit/enrich in Python."""
+    f = dict(req.get("filter") or {})
+    text = f.pop("body")
+    first = call({"op": "list", "account": req.get("account"), "mailbox": req.get("mailbox"),
+                  "filter": f, "limit": 0, "lite": True}, timeout)
+    t0 = time.time()
+    hits = body_filter(first["messages"], text, timeout)
+    debug(f"body match over {len(first['messages'])} candidates: {time.time() - t0:.2f}s")
+    rows = [r for r in first["messages"] if f"{r['account']}:{r['id']}" in hits]
+    rows.sort(key=lambda r: r["date"] or "", reverse=True)
+    total = len(rows)
+    if req.get("limit"):
+        rows = rows[: req["limit"]]
+    for r in rows:
+        hit = hits[f"{r['account']}:{r['id']}"]
+        r["messageId"] = hit[0] if hit else None
+        if req.get("snippet") and hit:
+            r["snippet"] = hit[1][: req["snippet"]]
+        if not r.get("alsoIn"):
+            r.pop("alsoIn", None)
+    return {"total": total, "shown": len(rows), "messages": rows, "skipped": first.get("skipped", [])}
+
+
+def apply_body_filter(req, timeout):
+    """For senders/unsubscribe: replace a body filter with an explicit id filter."""
+    f = req.get("filter") or {}
+    if not f.get("body"):
+        return req
+    text = f.pop("body")
+    first = call({"op": "list", "account": req.get("account"), "mailbox": req.get("mailbox"),
+                  "filter": f, "limit": 0, "lite": True}, timeout)
+    f["ids"] = sorted(body_filter(first["messages"], text, timeout)) or ["-:-"]  # "-:-" matches nothing
+    return req
+
+
+# ---------- Envelope Index backend (read-only commands) ----------
+
+def emlx_headers(path):
+    with open(path, "rb") as fh:
+        n = int(fh.readline())
+        raw = fh.read(n)
+    return email.parser.BytesHeaderParser().parsebytes(raw)
+
+
+def group_senders(rows, limit):
+    groups = {}
+    for r in rows:
+        frm = r["from"] or ""
+        addr = (frm.split("<")[-1].rstrip(">") if "<" in frm else frm).lower()
+        g = groups.setdefault(addr, {"address": addr, "name": sender_name(frm), "count": 0, "unread": 0, "accounts": [],
+                                     "latest": None, "latestSubject": "", "refs": []})
+        g["count"] += 1
+        g["unread"] += 0 if r["read"] else 1
+        if r["account"] not in g["accounts"]:
+            g["accounts"].append(r["account"])
+        if not g["latest"] or (r["date"] or "") > g["latest"]:
+            g["latest"], g["latestSubject"] = r["date"], r["subject"]
+        g["refs"].append(r["ref"])
+    out = sorted(groups.values(), key=lambda g: (-g["count"], "" if not g["latest"] else "~" + g["latest"]))
+    out.sort(key=lambda g: g["count"], reverse=True)
+    return {"total": len(out), "senders": out[:limit] if limit > 0 else out}
+
+
+def run_db(store, c, req, timeout):
+    if c == "accounts":
+        out = []
+        for acc in store.accounts.values():
+            box = store.resolve_mailbox(acc, "inbox", optional=True)
+            total, unread = store.count(acc, box) if box else (None, None)
+            out.append({"name": acc["name"], "emails": acc["emails"], "user": acc["user"], "enabled": acc["enabled"],
+                        "inbox": {"total": total, "unread": unread} if box else None})
+        return out
+    if c == "mailboxes":
+        out = []
+        for acc in store.resolve_accounts(req.get("account")):
+            boxes = []
+            for b in sorted(store.boxes_of(acc), key=lambda b: b["path"]):
+                total, unread = store.count(acc, b)
+                o = {"name": b["name"], "path": b["path"], "unread": unread}
+                if req.get("counts"):
+                    o["total"] = total
+                for role, names in mail_db.ROLES.items():
+                    if b["name"].lower() in [n.lower() for n in names]:
+                        o["role"] = role
+                boxes.append(o)
+            out.append({"account": acc["name"], "mailboxes": boxes})
+        return out
+    if c == "count":
+        out = []
+        for acc in store.resolve_accounts(req.get("account")):
+            for b in store.mailboxes_for(acc, req.get("mailbox")):
+                total, unread = store.count(acc, b)
+                out.append({"account": acc["name"], "mailbox": b["name"], "total": total, "unread": unread})
+        return out
+
+    f = dict(req.get("filter") or {})
+    body = f.pop("body", None)
+    rows = store.gather(req.get("account"), req.get("mailbox"), f)
+    hits = None
+    if body:
+        hits = body_filter(rows, body, timeout)
+        rows = [r for r in rows if f"{r['account']}:{r['id']}" in hits]
+    rows.sort(key=lambda r: (r["date"] or "", r["id"]), reverse=True)
+    for r in rows:
+        if not r.get("alsoIn"):
+            r.pop("alsoIn", None)
+
+    if c == "senders":
+        return group_senders(rows, req.get("limit", 20))
+
+    if c == "unsubscribe":
+        rows = rows[: req.get("scan") or 50]
+        idx = emlx_index()
+        groups = {}
+        for r in rows:
+            path = idx.get(str(r["id"]))
+            if not path:
+                continue
+            try:
+                h = emlx_headers(path)
+            except Exception:
+                continue
+            lu = " ".join(str(h.get("List-Unsubscribe") or "").split())
+            if not lu:
+                continue
+            links = re.findall(r"<([^>]+)>", lu)
+            frm = r["from"] or ""
+            addr = (frm.split("<")[-1].rstrip(">") if "<" in frm else frm).lower()
+            g = groups.setdefault(addr, {"address": addr, "name": sender_name(frm), "count": 0, "accounts": [],
+                                         "latestSubject": r["subject"], "latest": r["date"],
+                                         "oneClick": bool(h.get("List-Unsubscribe-Post")), "http": None, "mailto": None, "refs": []})
+            g["count"] += 1
+            if r["account"] not in g["accounts"]:
+                g["accounts"].append(r["account"])
+            g["http"] = g["http"] or next((l for l in links if l.lower().startswith("http")), None)
+            g["mailto"] = g["mailto"] or next((l for l in links if l.lower().startswith("mailto:")), None)
+            g["refs"].append(r["ref"])
+        return {"scanned": len(rows), "senders": sorted(groups.values(), key=lambda g: -g["count"])}
+
+    # list / search
+    total = len(rows)
+    if req.get("limit"):
+        rows = rows[: req["limit"]]
+    if req.get("snippet"):
+        idx = emlx_index()
+        for r in rows:
+            hit = hits.get(f"{r['account']}:{r['id']}") if hits else None
+            text = hit[1] if hit else None
+            if text is None and idx.get(str(r["id"])):
+                try:
+                    text = " ".join(emlx_text(idx[str(r["id"])]).replace("\N{OBJECT REPLACEMENT CHARACTER}", " ").split())
+                except Exception:
+                    text = None
+            r["snippet"] = text[: req["snippet"]] if text else None
+    return {"total": total, "shown": len(rows), "messages": rows, "skipped": []}
+
+
+def open_store(timeout):
+    backend = os.environ.get("MAILCTL_BACKEND", "auto")
+    if backend == "jxa":
+        return None
+    try:
+        return mail_db.Store(lambda r: call(r, timeout))
+    except mail_db.Unavailable as e:
+        if backend == "db":
+            sys.exit(f"mailctl: {e}")
+        debug(f"Envelope Index unavailable, using Mail.app: {e}")
+        return None
+
+
+# ---------- formatting ----------
+
+def local(iso, fmt="%m/%d %H:%M"):
+    if not iso:
+        return "-"
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime(fmt)
+
+
+def sender_name(s):
+    s = s or ""
+    if "<" in s:
+        name = s.split("<")[0].strip().strip('"')
+        return name or s.split("<")[1].rstrip(">")
+    return s
+
+
+def print_messages(data, with_ref=True):
+    for m in data["messages"]:
+        mark = ("●" if not m["read"] else " ") + ("⚑" if m["flagged"] else " ")
+        line = f"{mark} {' '.join((m['subject'] or '').split())} — {sender_name(m['from'])} ({m['account']} · {local(m['date'])})"
+        print(line)
+        if m.get("snippet"):
+            print(f"     {m['snippet']}")
+        if with_ref:
+            print(f"     ref={m['ref']}")
+    print(f"-- {data['shown']}/{data['total']} shown")
+    for s in data.get("skipped") or []:
+        print(f"   (skipped {s})", file=sys.stderr)
+
+
+def print_results(rows):
+    for r in rows:
+        if r.get("status") == "error":
+            print(f"✗ {r['ref']}: {r['error']}")
+            continue
+        extra = f" → {r['newRef']}" if r.get("newRef") else ""
+        dest = r.get("to") or r.get("action", "")
+        print(f"{'✓' if not r['status'].startswith('dry') else '·'} [{r['status']}] {r['subject']} — {sender_name(r['from'])}  {r['ref']} ⇒ {dest}{extra}")
+
+
+# ---------- args ----------
+
+def parse_date(s):
+    s = s.strip()
+    if s[-1:] in "dhw" and s[:-1].isdigit():
+        n = int(s[:-1])
+        delta = {"d": timedelta(days=n), "h": timedelta(hours=n), "w": timedelta(weeks=n)}[s[-1]]
+        return (datetime.now().astimezone() - delta).isoformat()
+    return datetime.fromisoformat(s).astimezone().isoformat()
+
+
+def add_scope(p, mailbox_default="INBOX"):
+    p.add_argument("-a", "--account", help="account name or address; comma-separated for several (default: every enabled account)")
+    p.add_argument("-m", "--mailbox", default=mailbox_default,
+                   help="mailbox name, role (inbox/archive/trash/junk/sent/drafts), comma list, or '*' for all (default: %(default)s)")
+
+
+def add_filters(p):
+    g = p.add_argument_group("filters")
+    g.add_argument("-q", "--query", help="text in subject or sender")
+    g.add_argument("--from", dest="from_", help="text in sender (name or address)")
+    g.add_argument("--subject", help="text in subject")
+    g.add_argument("--body", help="text in body (reads local .emlx files; falls back to Mail for undownloaded ones)")
+    g.add_argument("--since", type=parse_date, help="received after: 2026-11-01 or 7d / 12h / 2w")
+    g.add_argument("--before", type=parse_date, help="received before")
+    g.add_argument("--unread", action="store_true")
+    g.add_argument("--flagged", action="store_true")
+
+
+def filters_of(a):
+    f = {"query": a.query, "from": a.from_, "subject": a.subject, "body": a.body, "since": a.since,
+         "before": a.before, "unread": a.unread, "flagged": a.flagged}
+    return {k: v for k, v in f.items() if v}
+
+
+def read_refs(refs):
+    if refs == ["-"]:
+        refs = [ln.split()[0] for ln in sys.stdin if ln.strip()]
+    return refs
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mailctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="print raw JSON")
+    ap.add_argument("--timeout", type=int, default=180, help="seconds to wait for Mail.app (default: %(default)s)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print raw JSON")
+    _add = sub.add_parser
+    sub.add_parser = lambda *a, **k: _add(*a, parents=[common], **k)
+
+    sub.add_parser("accounts", help="accounts with addresses and INBOX counts")
+
+    p = sub.add_parser("mailboxes", help="mailboxes per account")
+    p.add_argument("-a", "--account")
+    p.add_argument("--counts", action="store_true", help="also count messages (slower)")
+
+    p = sub.add_parser("count", help="total/unread per mailbox")
+    add_scope(p)
+
+    for name, hlp in (("list", "newest messages (same filters as search)"), ("search", "find messages")):
+        p = sub.add_parser(name, help=hlp)
+        add_scope(p)
+        add_filters(p)
+        p.add_argument("-n", "--limit", type=int, default=20, help="0 = no limit (default: %(default)s)")
+        p.add_argument("--snippet", type=int, nargs="?", const=160, help="add first N chars of the body")
+        p.add_argument("--refs", action="store_true", help="print only refs, one per line (pipe into move/archive/trash)")
+
+    p = sub.add_parser("read", help="show one message")
+    p.add_argument("ref")
+    p.add_argument("--max-chars", type=int, default=4000)
+    p.add_argument("--headers", action="store_true", help="include all raw headers")
+    p.add_argument("--source", action="store_true", help="include raw RFC 822 source")
+    p.add_argument("--max-bytes", type=int, default=65536)
+
+    for name, hlp in (("archive", "move to the account's archive mailbox (Gmail: 전체보관함)"),
+                      ("trash", "move to the account's trash mailbox"),
+                      ("inbox", "move back to INBOX")):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("refs", nargs="+", help="refs, or '-' to read them from stdin")
+        p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("move", help="move to a mailbox (name, role, or Account:Mailbox)")
+    p.add_argument("refs", nargs="+")
+    p.add_argument("--to", required=True)
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("mark", help="mark read/unread/flag/unflag")
+    p.add_argument("action", choices=["read", "unread", "flag", "unflag"])
+    p.add_argument("refs", nargs="+")
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("senders", help="group messages by sender (triage)")
+    add_scope(p)
+    add_filters(p)
+    p.add_argument("-n", "--limit", type=int, default=20)
+
+    p = sub.add_parser("unsubscribe", help="senders whose mail carries List-Unsubscribe")
+    add_scope(p)
+    add_filters(p)
+    p.add_argument("--scan", type=int, default=50, help="newest N messages to inspect (default: %(default)s)")
+
+    a = ap.parse_args()
+    req = {"op": a.cmd}
+    c = a.cmd
+    if c == "mailboxes":
+        req.update(account=a.account, counts=a.counts)
+    elif c == "count":
+        req.update(account=a.account, mailbox=a.mailbox)
+    elif c in ("list", "search"):
+        req.update(op="list", account=a.account, mailbox=a.mailbox, filter=filters_of(a),
+                   limit=a.limit, snippet=a.snippet)
+    elif c == "read":
+        req.update(ref=a.ref, maxChars=a.max_chars, headers=a.headers, source=a.source, maxBytes=a.max_bytes)
+    elif c in ("archive", "trash", "inbox", "move", "mark"):
+        req.update(refs=read_refs(a.refs), dryRun=a.dry_run)
+        if c == "move":
+            req["to"] = a.to
+        if c == "mark":
+            req["action"] = a.action
+        if not req["refs"]:
+            sys.exit("mailctl: no refs given")
+    elif c == "senders":
+        req.update(account=a.account, mailbox=a.mailbox, filter=filters_of(a), limit=a.limit)
+    elif c == "unsubscribe":
+        req.update(account=a.account, mailbox=a.mailbox, filter=filters_of(a), scan=a.scan)
+
+    store = open_store(a.timeout) if c in ("accounts", "mailboxes", "count", "list", "search", "senders", "unsubscribe") else None
+    if store:
+        t0 = time.time()
+        try:
+            data = run_db(store, c, req, a.timeout)
+        except ValueError as e:
+            sys.exit(f"mailctl: {e}")
+        debug(f"Envelope Index {c}: {time.time() - t0:.2f}s")
+    elif req["op"] == "list" and (req.get("filter") or {}).get("body"):
+        data = body_search(req, a.timeout)
+    else:
+        req = apply_body_filter(req, a.timeout)
+        data = call(req, a.timeout)
+
+    if a.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    if c in ("list", "search"):
+        if a.refs:
+            for m in data["messages"]:
+                print(m["ref"])
+        else:
+            print_messages(data)
+    elif c == "accounts":
+        for x in data:
+            ib = x["inbox"] or {}
+            print(f"{x['name']:<10} {', '.join(x['emails']):<34} INBOX {ib.get('total', '-')} (unread {ib.get('unread', '-')}){'' if x['enabled'] else '  [disabled]'}")
+    elif c == "mailboxes":
+        for acc in data:
+            print(acc["account"])
+            for b in acc["mailboxes"]:
+                tot = f" total {b['total']}" if "total" in b else ""
+                role = f"  [{b['role']}]" if b.get("role") else ""
+                print(f"  {b['path']:<28} unread {b['unread']}{tot}{role}")
+    elif c == "count":
+        for r in data:
+            print(f"{r['account']:<10} {r['mailbox']:<14} total {r['total']:>5}  unread {r['unread']:>4}")
+        print(f"{'합계':<10} {'':<14} total {sum(r['total'] for r in data):>5}  unread {sum(r['unread'] for r in data):>4}")
+    elif c == "read":
+        print(f"Subject: {data['subject']}\nFrom:    {data['from']}\nTo:      {', '.join(data['to'])}")
+        if data["cc"]:
+            print(f"Cc:      {', '.join(data['cc'])}")
+        print(f"Date:    {local(data['date'], '%Y-%m-%d %H:%M')}\nRef:     {data['ref']}\nMsg-Id:  {data['messageId']}")
+        if data["attachments"]:
+            print(f"Attach:  {', '.join(data['attachments'])}")
+        print("\n" + data["content"].strip() + ("\n…(truncated)" if data["truncated"] else ""))
+        if data.get("headers"):
+            print("\n--- headers ---\n" + data["headers"])
+        if data.get("source"):
+            print("\n--- source ---\n" + data["source"])
+    elif c in ("archive", "trash", "inbox", "move", "mark"):
+        print_results(data)
+    elif c == "senders":
+        for s in data["senders"]:
+            print(f"{s['count']:>3} (unread {s['unread']}) {s['name']} <{s['address']}> [{', '.join(s['accounts'])}]  최근: {s['latestSubject']}")
+        print(f"-- {len(data['senders'])}/{data['total']} senders")
+    elif c == "unsubscribe":
+        for s in data["senders"]:
+            how = "one-click" if s["oneClick"] else ("link" if s["http"] else "mailto")
+            print(f"{s['count']:>3} {s['name']} <{s['address']}> [{', '.join(s['accounts'])}] {how}  최근: {s['latestSubject']}")
+            print(f"     {s['http'] or s['mailto']}")
+        print(f"-- {len(data['senders'])} senders with List-Unsubscribe in {data['scanned']} newest messages")
+
+
+if __name__ == "__main__":
+    main()
