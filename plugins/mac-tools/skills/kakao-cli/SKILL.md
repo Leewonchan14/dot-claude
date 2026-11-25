@@ -48,8 +48,6 @@ KakaoTalk's message database is encrypted, so everything is read from what the a
 - **Opening a room marks its unread messages read** (the other people see the "1" disappear). `read`/`open`
   refuse a room with unread messages unless `--mark-read` is given. Use `chats`/`unread` (last message
   preview) first, and pass `--mark-read` only when the user wants the room opened.
-- **Before `send`, show the user the exact chat and text and get an explicit OK**, unless the user's message
-  already gave the exact text and target. Then run with `--yes` and report the result.
 - Close chat windows you opened (`kakaoctl close <chat>`) when you are done, unless the user wants them open.
 
 ## Limits
